@@ -36,6 +36,10 @@ Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 SPIClass sdSPI(HSPI);
 bool sdReady = false;
 
+// 读卡器没到货 / 没接时置 false：setup() 不再卡死，进入"无卡模式"，
+// 名单、作业状态、屏幕、SD 存档都能先用串口验证。
+bool nfcReady = false;
+
 // ============ 颜色 ============
 #define BLACK   0x0000
 #define WHITE   0xFFFF
@@ -559,15 +563,19 @@ void showCheckInView() {
   setTextColor(WHITE);
   printCentered(96, line);
 
-  char cnt[24];
-  snprintf(cnt, sizeof(cnt), "已交 %d / %d", getSubmittedCount(currentHW), studentCount);
-  setTextColor(GREEN);
-  printCentered(138, cnt);
+  if (nfcReady) {
+    char cnt[24];
+    snprintf(cnt, sizeof(cnt), "已交 %d / %d", getSubmittedCount(currentHW), studentCount);
+    setTextColor(GREEN);
+    printCentered(138, cnt);
+  } else {
+    setTextColor(RED);
+    printCentered(138, "读卡器未连接");
+  }
 
   setTextColor(YELLOW);
-  setCursor(20, 202);  printStr("A开新");
-  setCursor(100, 202); printStr("B上翻");
-  setCursor(180, 202); printStr("C名单");
+  printCentered(186, "n 开新   u 上翻");
+  printCentered(208, "m 名单   h 帮助");
 }
 
 void showCheckInResult(int stuIdx, uint8_t *uid, uint8_t uidLen) {
@@ -581,7 +589,8 @@ void showCheckInResult(int stuIdx, uint8_t *uid, uint8_t uidLen) {
     printCentered(50, "未登记的卡");
 
     char uidStr[32];
-    uidToHex(uid, uidLen, uidStr);
+    if (uid && uidLen) uidToHex(uid, uidLen, uidStr);
+    else snprintf(uidStr, sizeof(uidStr), "--------");
     setTextColor(WHITE);
     printCentered(85, uidStr);
 
@@ -835,6 +844,20 @@ bool performWrite(uint8_t *uid, uint8_t uidLen) {
 
 // ============ 主程序 ============
 
+void printSerialHelp() {
+  Serial0.println("---- 串口命令 ----");
+  Serial0.println("  n    = 按键A：开新作业 / 确认");
+  Serial0.println("  u    = 按键B：上翻页 / 取消");
+  Serial0.println("  m    = 按键C：未交名单 / 下翻页");
+  Serial0.println("  s    = 进入登记模式");
+  Serial0.println("  w    = 进入 NTAG 写卡模式");
+  Serial0.println("  r    = 回到刷卡界面");
+  Serial0.println("  sim=<姓名>   模拟刷某人的卡");
+  Serial0.println("  sim=<UID>    模拟刷指定 UID");
+  Serial0.println("  sim?         模拟刷一张陌生卡");
+  Serial0.println("  h    = 显示本帮助");
+}
+
 void enterMode(SystemMode m) {
   sysMode = m;
   switch (m) {
@@ -906,6 +929,8 @@ void handleSerialSetup() {
     }
   }
 
+  if (!nfcReady) return;
+
   uint8_t uid[7];
   uint8_t uidLength;
   uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
@@ -938,6 +963,7 @@ void handleSerialSetup() {
 
 void setup(void) {
   Serial0.begin(115200);
+  Serial0.setTimeout(50);        // 串口命令按行读，别让 loop 卡在等换行上
   while (!Serial0) delay(10);
   delay(500);
   Serial0.println("=== RFID CheckIn ===");
@@ -956,17 +982,14 @@ void setup(void) {
 
   uint32_t ver = nfc.getFirmwareVersion();
   if (!ver) {
-    Serial0.println("ERROR: PN532 not found!");
-    fillColor(RED);
-    setTextBackground(RED);
-    setTextColor(WHITE);
-    printCentered(90, "找不到读卡模块");
-    printCentered(120, "检查 PN532 接线");
-    printCentered(150, "然后按复位键");
-    while (1) delay(1000);
+    Serial0.println("WARN: PN532 not found - running WITHOUT reader");
+    Serial0.println("      Use 'sim=<name>' to simulate a scan.");
+    nfcReady = false;
+  } else {
+    Serial0.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
+    nfc.SAMConfig();
+    nfcReady = true;
   }
-  Serial0.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
-  nfc.SAMConfig();
 
   Serial0.println("Init buttons...");
   pinMode(BTN_NEXT, INPUT_PULLUP);
@@ -999,10 +1022,7 @@ void setup(void) {
     enterMode(MODE_CHECKIN);
   }
 
-  Serial0.println("串口命令:");
-  Serial0.println("  s = setup mode (enroll)");
-  Serial0.println("  w = NTAG write mode");
-  Serial0.println("  r = normal mode");
+  printSerialHelp();
 }
 
 void loop(void) {
@@ -1033,6 +1053,8 @@ void loop(void) {
         Serial0.println("-> CHECKIN MODE");
       }
     }
+    if (!nfcReady) return;
+
     uint8_t uid[7];
     uint8_t uidLength;
     uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
@@ -1074,22 +1096,58 @@ void loop(void) {
     return;
   }
 
+  // 串口命令：n/u/m 等价于按键 A/B/C，没有按键时靠这些操作
   while (Serial0.available()) {
-    char c = Serial0.read();
-    if (c == 's' || c == 'S') {
-      enterMode(MODE_SETUP);
-      Serial0.println("-> SETUP MODE");
+    String cmd = Serial0.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.length() == 0) continue;
+    char c = cmd[0];
+
+    if (c == 'n' || c == 'N') { btnNextFlag = true; Serial0.println("[A] next / confirm"); }
+    else if (c == 'u' || c == 'U') { btnUpFlag = true; Serial0.println("[B] up / cancel"); }
+    else if (c == 'm' || c == 'M') { btnDownFlag = true; Serial0.println("[C] missing / down"); }
+    else if (c == 's' || c == 'S') { enterMode(MODE_SETUP); Serial0.println("-> SETUP MODE"); }
+    else if (c == 'w' || c == 'W') {
+      if (!nfcReady) { Serial0.println("Write mode needs PN532, not connected"); }
+      else { writeMode = true; writeLastLen = 0; enterMode(MODE_WRITE); Serial0.println("-> WRITE MODE"); }
     }
-    if (c == 'w' || c == 'W') {
-      writeMode = true;
-      writeLastLen = 0;
-      enterMode(MODE_WRITE);
-      Serial0.println("-> WRITE MODE");
-    }
-    if (c == 'r' || c == 'R') {
+    else if (c == 'r' || c == 'R') { enterMode(MODE_CHECKIN); Serial0.println("-> CHECKIN MODE"); }
+    else if (cmd.startsWith("sim=")) {
+      String arg = cmd.substring(4);
+      arg.trim();
+      if (arg.length() == 0) { Serial0.println("用法: sim=<姓名> 或 sim=<UID十六进制> 或 sim?"); continue; }
+      if (arg == "?") { showCheckInResult(-1, nullptr, 0); Serial0.println("sim: unknown card"); continue; }
+
+      // 先按姓名找，找不到再按 UID 十六进制找
+      int idx = -1;
+      for (uint8_t i = 0; i < studentCount; i++) {
+        if (strcmp(roster[i].name, arg.c_str()) == 0) { idx = i; break; }
+      }
+      if (idx >= 0) {
+        Serial0.printf("sim: %s\n", roster[idx].name);
+        showCheckInResult(idx, roster[idx].uid, roster[idx].uidLen);
+      } else {
+        uint8_t uid[7] = {0};
+        uint8_t len = 0;
+        String tok = "";
+        for (int i = 0; i < (int)arg.length(); i++) {
+          char ch = arg[i];
+          if (ch == ' ' || ch == ':') {
+            if (tok.length() == 2 && len < 7) uid[len++] = (uint8_t)strtol(tok.c_str(), NULL, 16);
+            tok = "";
+          } else tok += ch;
+        }
+        if (tok.length() == 2 && len < 7) uid[len++] = (uint8_t)strtol(tok.c_str(), NULL, 16);
+        if (len == 0) { Serial0.println("sim: 找不到这个学生"); continue; }
+        idx = findStudent(uid, len);
+        Serial0.printf("sim: UID -> %s\n", idx >= 0 ? roster[idx].name : "UNKNOWN");
+        showCheckInResult(idx, uid, len);
+      }
+      delay(1500);
       enterMode(MODE_CHECKIN);
-      Serial0.println("-> CHECKIN MODE");
     }
+    else if (c == 'h' || c == 'H') printSerialHelp();
+    else Serial0.println("未知命令，输入 h 看帮助");
   }
 
   if (btnNextFlag) {
@@ -1131,6 +1189,7 @@ void loop(void) {
   }
 
   if (sysMode != MODE_CHECKIN) return;
+  if (!nfcReady) return;
 
   uint8_t uid[7];
   uint8_t uidLength;
