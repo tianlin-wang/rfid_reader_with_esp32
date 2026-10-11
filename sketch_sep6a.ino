@@ -48,6 +48,7 @@ bool nfcReady = false;
 #define BLUE    0x001F
 #define CYAN    0x07FF
 #define YELLOW  0xFFE0
+#define GRAY    0x8410   // 次要信息（UID、页码），别跟正文抢注意力
 
 // ============ 数据模型 ============
 #define MAX_STUDENTS 50
@@ -57,6 +58,9 @@ bool nfcReady = false;
 struct Student {
   uint8_t uid[7];
   uint8_t uidLen;
+  // 专属编号，1~MAX_STUDENTS，登记时按顺序自动分配。
+  // 同时写进卡片用户页，刷卡时读回来和这里比对，能抓出拿错卡/换卡。
+  uint16_t sid;
   // 16 字节 = 5 个汉字（UTF-8 3 字节/字）+ 结束符。
   // 原来是 12 字节，只能塞 3 个汉字，四个字的名字会被截断。
   char name[16];
@@ -112,6 +116,13 @@ void IRAM_ATTR isrDown() {
 }
 
 // ============ 存储层 (SD Card CSV) ============
+// 下面几个函数定义在后面的写卡区，这里先声明
+int findStudentBySid(uint16_t sid);
+void saveRoster();
+uint16_t nextFreeSid();
+bool writeCardSid(uint16_t sid);
+bool readCardSid(uint16_t *sid);
+
 bool initSD() {
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   sdReady = SD.begin(SD_CS, sdSPI, 4000000);
@@ -135,11 +146,13 @@ void saveRoster() {
   File f = SD.open("/roster.csv", FILE_WRITE);
   if (!f) { Serial0.println("Cannot write roster.csv"); return; }
   f.println("# RFID CheckIn Roster");
-  f.println("# UID_HEX,NAME");
+  f.println("# UID_HEX,SID,NAME");
   for (uint8_t i = 0; i < studentCount; i++) {
     char uidStr[32];
     uidToHex(roster[i].uid, roster[i].uidLen, uidStr);
-    f.print(uidStr); f.print(","); f.println(roster[i].name);
+    f.print(uidStr); f.print(",");
+    f.print(roster[i].sid); f.print(",");
+    f.println(roster[i].name);
   }
   f.close();
   Serial0.println("roster.csv saved");
@@ -160,7 +173,7 @@ void loadRoster() {
     int comma = line.indexOf(',');
     if (comma <= 0) continue;
     String uidPart = line.substring(0, comma);
-    String namePart = line.substring(comma + 1);
+    String rest = line.substring(comma + 1);
 
     uint8_t uidBuf[7] = {0};
     uint8_t uidLen = 0;
@@ -180,13 +193,41 @@ void loadRoster() {
     }
     if (uidLen == 0) continue;
 
+    // 新格式 UID,SID,NAME；旧格式 UID,NAME 只有两列，
+    // 此时第二个逗号找不到，就当没有编号、按顺序补一个。
+    uint16_t sid = 0;
+    String namePart = rest;
+    int comma2 = rest.indexOf(',');
+    if (comma2 >= 0) {
+      sid = (uint16_t)strtol(rest.substring(0, comma2).c_str(), NULL, 10);
+      namePart = rest.substring(comma2 + 1);
+    }
+
     memcpy(roster[studentCount].uid, uidBuf, uidLen);
     roster[studentCount].uidLen = uidLen;
+    roster[studentCount].sid = sid;
     strncpy(roster[studentCount].name, namePart.c_str(), sizeof(roster[studentCount].name) - 1);
     roster[studentCount].name[sizeof(roster[studentCount].name) - 1] = 0;
     studentCount++;
   }
   f.close();
+
+  // 编号为 0 说明是老格式，按顺序补齐，顺便排掉重复编号
+  bool needFix = false;
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (roster[i].sid == 0) needFix = true;
+  }
+  if (needFix) {
+    Serial0.println("Old roster format, assigning SIDs...");
+    uint16_t s = 1;
+    for (uint8_t i = 0; i < studentCount; i++) {
+      if (roster[i].sid != 0) continue;
+      while (s <= MAX_STUDENTS && findStudentBySid(s) >= 0) s++;
+      if (s > MAX_STUDENTS) break;
+      roster[i].sid = s++;
+    }
+    saveRoster();
+  }
   Serial0.printf("Loaded %d students from SD\n", studentCount);
 }
 
@@ -284,10 +325,11 @@ void saveCurrentHWFile() {
   File f = SD.open(path, FILE_WRITE);
   if (!f) return;
   f.printf("# HW %d Submissions\n", currentHW + 1);
-  f.println("# NAME,UID,SUBMITTED");
+  f.println("# SID,NAME,UID,SUBMITTED");
   for (uint8_t i = 0; i < studentCount; i++) {
     char uidStr[32];
     uidToHex(roster[i].uid, roster[i].uidLen, uidStr);
+    f.print(roster[i].sid); f.print(",");
     f.print(roster[i].name); f.print(","); f.print(uidStr); f.print(",");
     f.println(isSubmitted(currentHW, i) ? "1" : "0");
   }
@@ -664,30 +706,35 @@ void showCheckInResult(int stuIdx, uint8_t *uid, uint8_t uidLen) {
     return;
   }
 
+  char idBuf[32];
+  snprintf(idBuf, sizeof(idBuf), "[%04u]", roster[stuIdx].sid);
+  setTextColor(GRAY);
+  printCentered(30, idBuf);
+
   setTextColor(WHITE);
-  printCentered(46, roster[stuIdx].name);
+  printCentered(56, roster[stuIdx].name);
 
   if (isSubmitted(currentHW, stuIdx)) {
     setTextColor(YELLOW);
-    printCentered(80, "这次已经交过了");
+    printCentered(88, "这次已经交过了");
   } else {
     markSubmitted(currentHW, stuIdx);
     setTextColor(GREEN);
-    printCentered(80, "提交成功");
+    printCentered(88, "提交成功");
   }
 
   uint8_t submitted = getSubmittedCount(currentHW);
   uint8_t pct = studentCount ? (submitted * 100 / studentCount) : 0;
 
   // 进度条：外框 + 填充
-  lcd.drawRect(20, 116, 200, 12, WHITE);
+  lcd.drawRect(20, 120, 200, 12, WHITE);
   uint16_t barW = (uint16_t)submitted * 196 / (studentCount ? studentCount : 1);
-  fillRect(22, 118, barW, 8, GREEN);
+  fillRect(22, 122, barW, 8, GREEN);
 
   char prog[32];
   snprintf(prog, sizeof(prog), "已交 %d/%d  %d%%", submitted, studentCount, pct);
   setTextColor(WHITE);
-  printCentered(145, prog);
+  printCentered(148, prog);
 
   setTextColor(CYAN);
   printCentered(180, "继续刷下一本");
@@ -731,12 +778,13 @@ void showMissingView() {
 
   int row = 28;
   for (uint8_t i = start; i < end; i++) {
-    char num[8];
-    snprintf(num, sizeof(num), "%d.", i + 1);
+    // 左列编号（4 位数字 + 两个空格 = 48px），右列姓名
+    char num[12];
+    snprintf(num, sizeof(num), "%04u", roster[missing[i]].sid);
     setTextColor(CYAN);
-    setCursor(8, row); printStr(num);
+    setCursor(6, row); printStr(num);
     setTextColor(WHITE);
-    printStr(" ");
+    setCursor(60, row);
     printStr(roster[missing[i]].name);
     row += 19;
   }
@@ -812,13 +860,161 @@ void showSetupMode() {
   printCentered(216, "长按 A 会清空记录");
 }
 
-// ============ 写卡 UI + 逻辑（保留） ============
+// ============ 写卡：给每个学生发专属编号并写进卡片 ============
+//
+// 卡片用户页布局（只占 2 页，写起来快，刷卡校验也快）：
+//   第 8 页: 'R' 'F' 'I' 'D'   魔数，一眼认出是我们的卡
+//   第 9 页: 版本号 | 编号高字节 | 编号低字节 | 校验和
+//   校验和 = 前 7 个字节按位异或，防止卡被写坏或读到脏数据
+//
+// 为什么不再写那个固定字符串 "HELLO-RFID-TEST-!"：所有卡内容一样，
+// 刷卡时没法核对身份，只能靠 UID 猜。
+
 #define NTAG_START_PAGE  8
-#define NTAG_PAGE_COUNT  16
-const uint8_t WRITE_DATA[] = "HELLO-RFID-TEST-!";
+#define NTAG_MAGIC_P0    'R'
+#define NTAG_MAGIC_P1    'F'
+#define NTAG_MAGIC_P2    'I'
+#define NTAG_MAGIC_P3    'D'
+#define CARD_VERSION     1
+
 bool writeMode = false;
 uint8_t writeLastUID[7] = {0};
 uint8_t writeLastLen = 0;
+
+// 当前待写入的编号；写卡模式下刷卡时分配
+uint16_t writePendingSid = 0;
+
+static uint8_t xorSum(const uint8_t *d, uint8_t n) {
+  uint8_t s = 0;
+  for (uint8_t i = 0; i < n; i++) s ^= d[i];
+  return s;
+}
+
+// 读回卡内编号。返回 true 表示卡里确实是本系统的卡且校验通过
+bool readCardSid(uint16_t *sid) {
+  if (!nfcReady) return false;
+
+  uint8_t p0[4] = {0}, p1[4] = {0};
+  if (!nfc.ntag2xx_ReadPage(NTAG_START_PAGE, p0)) return false;
+  delay(20);
+  if (!nfc.ntag2xx_ReadPage(NTAG_START_PAGE + 1, p1)) return false;
+  delay(20);
+
+  Serial0.print("Card raw: ");
+  for (int i = 0; i < 4; i++) Serial0.printf("%02X ", p0[i]);
+  for (int i = 0; i < 4; i++) Serial0.printf("%02X ", p1[i]);
+  Serial0.println();
+
+  if (p0[0] != NTAG_MAGIC_P0 || p0[1] != NTAG_MAGIC_P1 ||
+      p0[2] != NTAG_MAGIC_P2 || p0[3] != NTAG_MAGIC_P3) {
+    Serial0.println("  -> not our card (magic mismatch)");
+    return false;
+  }
+  if (p1[0] != CARD_VERSION) {
+    Serial0.printf("  -> version %u, expect %u\n", p1[0], CARD_VERSION);
+    return false;
+  }
+  if (xorSum(p0, 4) != 0 || p1[0] ^ p1[1] ^ p1[2] != p1[3]) {
+    Serial0.println("  -> CRC failed, card data corrupted");
+    return false;
+  }
+
+  *sid = ((uint16_t)p1[1] << 8) | p1[2];
+  Serial0.printf("  -> card sid=%u\n", *sid);
+  return true;
+}
+
+// 把编号写进卡片，写完立刻读回核对
+bool writeCardSid(uint16_t sid) {
+  if (!nfcReady) return false;
+
+  uint8_t p0[4] = {NTAG_MAGIC_P0, NTAG_MAGIC_P1, NTAG_MAGIC_P2, NTAG_MAGIC_P3};
+  uint8_t p1[4] = {CARD_VERSION, (uint8_t)(sid >> 8), (uint8_t)(sid & 0xFF), 0};
+  p1[3] = xorSum(p1, 3);
+
+  Serial0.printf("Write sid=%u (hi=%02X lo=%02X crc=%02X)\n",
+                 sid, p1[1], p1[2], p1[3]);
+
+  if (!nfc.ntag2xx_WritePage(NTAG_START_PAGE, p0)) return false;
+  delay(60);
+  if (!nfc.ntag2xx_WritePage(NTAG_START_PAGE + 1, p1)) return false;
+  delay(60);
+
+  uint16_t back = 0;
+  if (!readCardSid(&back)) {
+    Serial0.println("  verify read failed");
+    return false;
+  }
+  if (back != sid) {
+    Serial0.printf("  verify MISMATCH: wrote %u, read %u\n", sid, back);
+    return false;
+  }
+  Serial0.println("  verify OK");
+  return true;
+}
+
+// 下一个可用的顺序编号：跳过已占用的
+uint16_t nextFreeSid() {
+  for (uint16_t s = 1; s <= MAX_STUDENTS; s++) {
+    bool used = false;
+    for (uint8_t i = 0; i < studentCount; i++) {
+      if (roster[i].sid == s) { used = true; break; }
+    }
+    if (!used) return s;
+  }
+  return 0;   // 编号用完了
+}
+
+// 按编号反查学生，-1 表示没人
+int findStudentBySid(uint16_t sid) {
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (roster[i].sid == sid) return i;
+  }
+  return -1;
+}
+
+// 编号核对失败：卡里存的编号和名单不一致，或者卡没写过编号
+void showSidMismatch(int stuIdx, uint16_t cardSid, uint8_t *uid, uint8_t len) {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+
+  setTextColor(RED);
+  printCentered(30, "编号不符");
+
+  char buf[32];
+  if (stuIdx >= 0) {
+    snprintf(buf, sizeof(buf), "名单编号 %04u", roster[stuIdx].sid);
+    setTextColor(WHITE);
+    printCentered(70, buf);
+
+    if (cardSid == 0) {
+      setTextColor(YELLOW);
+      printCentered(92, "卡里没有编号");
+    } else {
+      snprintf(buf, sizeof(buf), "卡里编号 %04u", cardSid);
+      setTextColor(YELLOW);
+      printCentered(92, buf);
+      // 如果卡里那个编号属于别人，直接告诉你是谁
+      int other = findStudentBySid(cardSid);
+      if (other >= 0) {
+        setTextColor(CYAN);
+        snprintf(buf, sizeof(buf), "那是 %s 的卡", roster[other].name);
+        printCentered(114, buf);
+      }
+    }
+
+    setTextColor(WHITE);
+    printCentered(146, roster[stuIdx].name);
+
+    setTextColor(GRAY);
+    char uidStr[32];
+    uidToHex(uid, len, uidStr);
+    printCentered(168, uidStr);
+  }
+
+  setTextColor(YELLOW);
+  printCentered(200, "别代交  拿开重刷");
+}
 
 void showWriteMode() {
   fillColor(BLACK);
@@ -832,78 +1028,47 @@ void showWriteMode() {
   drawFastHLine(0, HEADER_H, 240, YELLOW);
 
   setTextColor(CYAN);
-  printCentered(46, "放上 NTAG 标签");
+  printCentered(44, "放上一张空白标签");
 
+  char buf[32];
+  snprintf(buf, sizeof(buf), "将分配编号 %04u", writePendingSid);
   setTextColor(WHITE);
-  printCentered(90, "写入页  8");
-  printCentered(112, "页数 16");
-  printCentered(134, "每页 4 字节");
+  printCentered(84, buf);
+  setTextColor(GRAY);
+  printCentered(106, "写完刷另一张继续");
 
-  setTextColor(GREEN);
+  setTextColor(YELLOW);
   printCentered(196, "r 退出写卡");
 }
 
-void showWriteOK(uint8_t *uid, uint8_t len) {
+// 写卡结果页。kind: 0=成功新卡 1=重写已有卡 2=失败
+void showWriteDone(uint8_t kind, uint16_t sid, uint8_t *uid, uint8_t len) {
   fillColor(BLACK);
   setTextBackground(BLACK);
 
-  setTextColor(GREEN);
-  printCentered(38, "写卡成功");
+  setTextColor(kind == 2 ? RED : GREEN);
+  printCentered(36, kind == 2 ? "写卡失败" : "写卡成功");
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "编号 %04u", sid);
+  setTextColor(WHITE);
+  printCentered(76, buf);
 
   char uidStr[32];
   uidToHex(uid, len, uidStr);
-  setTextColor(WHITE);
-  printCentered(80, uidStr);
+  setTextColor(GRAY);
+  printCentered(100, uidStr);
 
-  setTextColor(CYAN);
-  printCentered(130, "读回校验通过");
-
-  setTextColor(YELLOW);
-  printCentered(196, "r 退出    w 继续");
-}
-
-void showWriteFail(uint8_t reason) {
-  fillColor(BLACK);
-  setTextBackground(BLACK);
-
-  setTextColor(RED);
-  printCentered(38, "写卡失败");
-
-  setTextColor(WHITE);
-  if (reason == 0)      printCentered(84, "写命令无响应");
-  else if (reason == 1) printCentered(84, "写入后无应答");
-  else                  printCentered(84, "读回数据不一致");
-
-  setTextColor(YELLOW);
-  printCentered(140, "标签拿开一点");
-  printCentered(162, "再重新放上去");
-
-  setTextColor(GREEN);
-  printCentered(200, "r 退出写卡");
-}
-
-bool performWrite(uint8_t *uid, uint8_t uidLen) {
-  uint16_t dataLen = strlen((char*)WRITE_DATA);
-  Serial0.println("==== NTAG WRITE START ====");
-  Serial0.printf("dataLen=%d pages=%d\n", dataLen, NTAG_PAGE_COUNT);
-
-  for (uint8_t i = 0; i < NTAG_PAGE_COUNT; i++) {
-    uint8_t page = NTAG_START_PAGE + i;
-    uint16_t offset = i * 4;
-    uint8_t data[4] = {0, 0, 0, 0};
-    for (uint8_t b = 0; b < 4; b++) {
-      if (offset + b < dataLen) data[b] = WRITE_DATA[offset + b];
+  if (kind == 1) {
+    int stu = findStudentBySid(sid);
+    if (stu >= 0) {
+      setTextColor(CYAN);
+      snprintf(buf, sizeof(buf), "%s", roster[stu].name);
+      printCentered(128, buf);
     }
-    Serial0.printf("  Page %d -> ", page);
-    for (uint8_t k = 0; k < 4; k++) { if (data[k] < 0x10) Serial0.print("0"); Serial0.print(data[k], HEX); Serial0.print(" "); }
-
-    uint8_t w = nfc.ntag2xx_WritePage(page, data);
-    Serial0.printf(" -> %s\n", w ? "OK" : "FAIL");
-    if (!w) { showWriteFail(1); return false; }
-    delay(100);
   }
-  Serial0.println("==== NTAG WRITE DONE ====");
-  return true;
+  setTextColor(YELLOW);
+  printCentered(200, kind == 2 ? "换一张重试" : "换下一张继续");
 }
 
 // ============ 主程序 ============
@@ -913,9 +1078,10 @@ void printSerialHelp() {
   Serial0.println("  n    = 按键A：开新作业 / 确认");
   Serial0.println("  u    = 按键B：上翻页 / 取消");
   Serial0.println("  m    = 按键C：未交名单 / 下翻页");
-  Serial0.println("  s    = 进入登记模式");
-  Serial0.println("  w    = 进入 NTAG 写卡模式");
+  Serial0.println("  s    = 进入登记模式（刷卡 + name=姓名，自动发编号并写卡）");
+  Serial0.println("  w    = 进入写卡模式（批量发编号 / 补写卡）");
   Serial0.println("  r    = 回到刷卡界面");
+  Serial0.println("  list = 查看名单（含编号）");
   Serial0.println("  sim=<姓名>   模拟刷某人的卡");
   Serial0.println("  sim=<UID>    模拟刷指定 UID");
   Serial0.println("  sim?         模拟刷一张陌生卡");
@@ -928,7 +1094,13 @@ void enterMode(SystemMode m) {
     case MODE_CHECKIN: showCheckInView(); break;
     case MODE_MISSING: showMissingView(); break;
     case MODE_SETUP:   showSetupMode();   break;
-    case MODE_WRITE:   showWriteMode();   break;
+    case MODE_WRITE:
+      // 进来就把"下一个要发的编号"算好，写卡页要显示它
+      writePendingSid = nextFreeSid();
+      if (writePendingSid == 0) writePendingSid = MAX_STUDENTS;
+      Serial0.printf("Write mode, next free sid=%u\n", writePendingSid);
+      showWriteMode();
+      break;
     case MODE_CONFIRM_NEW: showNewHWConfirm(); break;
   }
 }
@@ -959,7 +1131,7 @@ void handleSerialSetup() {
     if (strcmp(line, "list") == 0) {
       Serial0.println("Current roster:");
       for (uint8_t i = 0; i < studentCount; i++) {
-        Serial0.printf("  %d. %s (UID:", i + 1, roster[i].name);
+        Serial0.printf("  [%04u] %s (UID:", roster[i].sid, roster[i].name);
         for (uint8_t k = 0; k < roster[i].uidLen; k++) {
           Serial0.printf(" %02X", roster[i].uid[k]);
         }
@@ -975,13 +1147,30 @@ void handleSerialSetup() {
         Serial0.println("Roster full!");
         continue;
       }
+      // 自动分配下一个空闲编号
+      uint16_t sid = nextFreeSid();
+      if (sid == 0) {
+        Serial0.println("No free SID left!");
+        continue;
+      }
       strncpy(roster[studentCount].name, line + 5, sizeof(roster[studentCount].name) - 1);
       roster[studentCount].name[sizeof(roster[studentCount].name) - 1] = 0;
       memcpy(roster[studentCount].uid, setupUID, setupUIDLen);
       roster[studentCount].uidLen = setupUIDLen;
+      roster[studentCount].sid = sid;
       studentCount++;
       saveRoster();
-      Serial0.printf("Saved: %d. %s\n", studentCount, roster[studentCount - 1].name);
+      Serial0.printf("Saved: [%04u] %s\n", roster[studentCount - 1].sid,
+                     roster[studentCount - 1].name);
+
+      // 顺手把这张卡的编号也写进去，省得再去写卡模式走一遍
+      if (nfcReady) {
+        if (writeCardSid(sid)) {
+          Serial0.printf("Card sid written and verified: %u\n", sid);
+        } else {
+          Serial0.printf("WARN: could not write sid to card, run 'w' mode to retry\n");
+        }
+      }
       waitingForName = false;
       showSetupMode();
     }
@@ -1135,13 +1324,43 @@ void loop(void) {
           Serial0.print(" ");
         }
         Serial0.println();
-        bool res = performWrite(uid, uidLength);
-        if (res) { showWriteOK(uid, uidLength); Serial0.println("WRITE OK"); }
-        else { Serial0.println("WRITE FAIL"); }
+
+        // 已经登记过的卡 -> 把它的编号重写回去（补写/修卡）
+        // 没登记过的卡 -> 分配一个新编号
+        int known = findStudent(uid, uidLength);
+        uint16_t sid;
+        uint8_t kind;
+        if (known >= 0) {
+          sid = roster[known].sid;
+          kind = 1;
+          Serial0.printf("Known card #%d, re-write sid=%u\n", known + 1, sid);
+        } else {
+          sid = nextFreeSid();
+          kind = 0;
+          Serial0.printf("New card, assign sid=%u\n", sid);
+        }
+
+        if (sid == 0) {
+          Serial0.println("No free SID left!");
+          showWriteDone(2, 0, uid, uidLength);
+        } else if (writeCardSid(sid)) {
+          showWriteDone(kind, sid, uid, uidLength);
+          Serial0.println("WRITE OK");
+          // 只有真发了新编号才推进待分配号
+          if (kind == 0) {
+            writePendingSid = nextFreeSid();
+            if (writePendingSid == 0) writePendingSid = MAX_STUDENTS;
+            showWriteMode();
+          }
+        } else {
+          showWriteDone(2, sid, uid, uidLength);
+          Serial0.println("WRITE FAIL");
+        }
+
         memcpy(writeLastUID, uid, uidLength);
         writeLastLen = uidLength;
-        delay(2000);
-        writeLastLen = 0;
+        delay(2500);
+        writeLastLen = 0;      // 清零，下一张卡才算"换卡"
       }
     }
     return;
@@ -1273,6 +1492,35 @@ void loop(void) {
       for (uint8_t i = 0; i < uidLength; i++) Serial0.printf("%02X ", uid[i]);
       if (idx >= 0) Serial0.printf("-> %s", roster[idx].name);
       else Serial0.print("-> UNKNOWN");
+
+      // 核对卡内编号：UID 对上名单还不够，卡里存的编号也得一致。
+      // 不一致说明这张卡是别人的（张冠李戴）或被改写过，必须拦下来。
+      if (idx >= 0) {
+        uint16_t cardSid = 0;
+        if (readCardSid(&cardSid)) {
+          if (cardSid == roster[idx].sid) {
+            Serial0.printf("  [sid %04u OK]", cardSid);
+          } else {
+            Serial0.printf("  [SID MISMATCH! card=%u roster=%u]",
+                           cardSid, roster[idx].sid);
+            Serial0.println("  !! 卡里编号和名单对不上，疑似拿错卡/换卡");
+            showSidMismatch(idx, cardSid, uid, uidLength);
+            memcpy(lastUID, uid, uidLength);
+            lastLen = uidLength;
+            delay(2500);
+            enterMode(MODE_CHECKIN);
+            return;
+          }
+        } else {
+          Serial0.println("  [card has no valid sid - was it written?]");
+          showSidMismatch(idx, 0, uid, uidLength);
+          memcpy(lastUID, uid, uidLength);
+          lastLen = uidLength;
+          delay(2500);
+          enterMode(MODE_CHECKIN);
+          return;
+        }
+      }
       Serial0.println();
 
       showCheckInResult(idx, uid, uidLength);
