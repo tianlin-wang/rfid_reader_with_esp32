@@ -1082,6 +1082,7 @@ void printSerialHelp() {
   Serial0.println("  w    = 进入写卡模式（批量发编号 / 补写卡）");
   Serial0.println("  r    = 回到刷卡界面");
   Serial0.println("  list = 查看名单（含编号）");
+  Serial0.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
   Serial0.println("  sim=<姓名>   模拟刷某人的卡");
   Serial0.println("  sim=<UID>    模拟刷指定 UID");
   Serial0.println("  sim?         模拟刷一张陌生卡");
@@ -1429,6 +1430,58 @@ void loop(void) {
       }
       delay(1500);
       enterMode(MODE_CHECKIN);
+    }
+    else if (cmd.startsWith("probe")) {
+      // 读卡器自检：只走读卡链路，不碰名单、不写卡，
+      // 用来确认接线和拨码开关对不对。
+      if (!nfcReady) {
+        Serial0.println("probe: PN532 没连上，先查接线和拨码开关");
+        continue;
+      }
+      Serial0.println("probe: 连续扫描 10 秒，把卡片放上去...");
+      unsigned long t0 = isrMillis();
+      uint8_t lastUID[7] = {0};
+      uint8_t lastLen = 0;
+      int seen = 0;
+      while (isrMillis() - t0 < 10000) {
+        uint8_t uid[7];
+        uint8_t len = 0;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len)) {
+          bool same = (len == lastLen);
+          if (same) for (uint8_t i = 0; i < len; i++)
+            if (uid[i] != lastUID[i]) { same = false; break; }
+          if (!same) {
+            Serial0.printf("  卡 #%d UID:", ++seen);
+            for (uint8_t i = 0; i < len; i++) Serial0.printf(" %02X", uid[i]);
+            Serial0.printf("  (%d 字节)", len);
+
+            uint16_t sid = 0;
+            if (readCardSid(&sid)) {
+              int owner = findStudentBySid(sid);
+              Serial0.printf("  编号=%04u", sid);
+              if (owner >= 0) Serial0.printf("  属于 %s", roster[owner].name);
+              else Serial0.print("  名单里没人");
+            } else {
+              Serial0.print("  卡内无编号（空白卡 / 非本系统）");
+            }
+            int known = findStudent(uid, len);
+            Serial0.printf("  名单:%s\n", known >= 0 ? roster[known].name : "未登记");
+            memcpy(lastUID, uid, len);
+            lastLen = len;
+          }
+          delay(300);
+        } else {
+          lastLen = 0;
+          delay(100);
+        }
+      }
+      Serial0.printf("probe 结束，共识别 %d 张卡\n", seen);
+      if (seen == 0) {
+        Serial0.println("一张都没读到，依次检查：");
+        Serial0.println("  1. 拨码开关是不是 SPI 模式");
+        Serial0.println("  2. SCK/MISO/MOSI/SS 四根线有没有接错或松动");
+        Serial0.println("  3. 卡片是不是 ISO14443A（NTAG/Mifare）—— 身份证和门禁卡不行");
+      }
     }
     else if (c == 'h' || c == 'H') printSerialHelp();
     else Serial0.println("未知命令，输入 h 看帮助");
