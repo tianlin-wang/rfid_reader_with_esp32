@@ -1,4 +1,4 @@
-﻿#define TFT_SCK    4
+#define TFT_SCK    4
 #define TFT_MOSI   5
 #define TFT_RST    6
 #define TFT_DC     7
@@ -21,10 +21,13 @@
 #define SD_MOSI   40
 #define SD_CS     39
 
-#include <Adafruit_PN532.h>
-#include <LovyanGFX.hpp>
+// ★ 顺序不能改：LovyanGFX 靠 `defined(_SD_H_)` 来决定是否为 fs::SDFS 生成
+//   DataWrapperT 特化。SD.h 必须在 LovyanGFX.hpp 之前包含，否则
+//   lcd.loadFont(SD, path) 会报 “invalid new-expression of abstract class type”。
 #include <SPI.h>
 #include <SD.h>
+#include <Adafruit_PN532.h>
+#include <LovyanGFX.hpp>
 #include "driver/gpio.h"
 #include "esp_timer.h"
 

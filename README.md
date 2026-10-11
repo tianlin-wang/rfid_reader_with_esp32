@@ -83,6 +83,43 @@ Arduino IDE 库管理器里装：
 
 > `font_cn.h` 约 770 KB 源码 / 120 KB flash，编译会慢一点，属正常现象。
 
+### ⚠️ 两个会让人怀疑人生的编译坑（已踩过）
+
+**1. 文件开头不能有 UTF-8 BOM**
+
+`sketch_sep6a.ino` 一旦带 BOM（`EF BB BF`），Arduino 的预处理会把 BOM 当成一个
+不可见字符拼在第一行 `#define` 前面，于是报：
+
+```
+sketch_sep6a.ino:1:4: error: stray '#' in program
+sketch_sep6a.ino:1:1: error: '<U+FEFF>' does not name a type
+```
+
+更坑的是**这一个 BOM 会干掉整个文件里所有的 `#define`**，于是后面跟着一串
+`TFT_SCK was not declared`、`HardwareI2C does not name a type`、
+`invalid new-expression of abstract class type`……看起来像几十个错误，其实只有一个原因。
+
+用 VS Code / Notepad++ 编辑时请确认编码是 **UTF-8（无 BOM）**。
+检查办法（PowerShell）：
+
+```powershell
+$b=[IO.File]::ReadAllBytes("sketch_sep6a.ino")[0..2]
+if($b[0]-eq 0xEF -and $b[1]-eq 0xBB -and $b[2]-eq 0xBF){"有BOM"}else{"没BOM"}
+```
+
+**2. `#include <SD.h>` 必须写在 `#include <LovyanGFX.hpp>` 之前**
+
+LovyanGFX 是靠 `#if defined(_SD_H_)` 判断"用户用了 SD 库"，才去生成
+`DataWrapperT<fs::SDFS>` 这个特化。如果 `LovyanGFX.hpp` 先被包含，`_SD_H_`
+还没定义，特化就不会生成，`lcd.loadFont(SD, path)` 会报：
+
+```
+invalid new-expression of abstract class type 'lgfx::v1::DataWrapperT<fs::SDFS>'
+```
+
+当前 `.ino` 顶部的顺序已经是 `SPI.h → SD.h → Adafruit_PN532.h → LovyanGFX.hpp`，
+**别去动这个顺序**。
+
 ---
 
 ## 使用流程
