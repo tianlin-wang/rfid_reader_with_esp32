@@ -1,14 +1,23 @@
-# ESP32 RFID Reader
+# 智能收作业系统（离线版）
 
-基于 **ESP32-S3** 的 RFID 读卡 / 写卡器，驱动一块 ST7789 TFT 240×240 屏幕和一块 PN532 RFID 模块。
+基于 **ESP32-S3 + PN532** 的课堂作业登记器：学生把贴了 NTAG 标签的作业本往读卡器上一放，屏幕立刻登记，全程离线，数据存在 SD 卡里断电不丢。
 
-支持 ISO14443A 标准卡，包括 **Mifare Classic** 和 **NTAG** 系列。
+> 早先版本只是个"读卡显示 UID"的演示器，现在是一个完整的收作业工具。老版本的功能（读卡 / NTAG 写卡）都保留了。
 
 ---
 
+## 功能
+
+- **刷卡登记** —— 作业本贴上 NTAG 标签，刷一下即登记，屏幕显示姓名、提交结果和全班进度条
+- **未交名单** —— 按 C 键随时翻看谁还没交，分页显示
+- **多次作业** —— 最多 30 次，全部交齐后自动进入下一次
+- **断电记忆** —— 名单和提交记录都写成 CSV 存在 SD 卡里，拔电重启接着用
+- **内置中文字库** —— 16×16 点阵字库编译进固件，不依赖 SD 卡字体文件
+- **写卡模式** —— 保留 NTAG 写卡功能，用来批量给新标签写入标识
+
 ## 硬件接线
 
-### ST7789 TFT (240×240)
+### ST7789 TFT (240×240) —— SPI2 (FSPI)
 
 | TFT Pin | ESP32 Pin |
 |---------|-----------|
@@ -19,7 +28,7 @@
 | CS      | 10        |
 | BLK     | 13        |
 
-### PN532 (SPI 模式)
+### PN532 (SPI 模式) —— 软件 SPI
 
 | PN532 Pin | ESP32 Pin |
 |-----------|-----------|
@@ -30,67 +39,111 @@
 | IRQ       | 11        |
 | RST       | 12        |
 
-> 两块模块各走各的 bit-bang SPI，没有共用引脚。
+> PN532 模块上的拨码开关要拨到 SPI 模式（SEL1=0，SEL2=1）。
+
+### SD 卡 —— SPI3 (HSPI)
+
+| SD Pin | ESP32 Pin |
+|--------|-----------|
+| SCK    | 42        |
+| MISO   | 41        |
+| MOSI   | 40        |
+| CS     | 39        |
+
+> **注意**：屏幕和 SD 卡必须走不同的 SPI 主机。代码里屏幕用 `SPI2_HOST`、SD 卡用 `SPI3_HOST`，如果改成同一个主机会因为两边各自调用 `spi_bus_initialize()` 互相冲突。
+
+### 按键（另一端接 GND，内部上拉）
+
+| 按键 | ESP32 Pin | 功能 |
+|------|-----------|------|
+| A    | 14        | 短按 = 开新作业 / 确认；**长按 1 秒 = 清空全部记录** |
+| B    | 15        | 上翻页 / 取消 |
+| C    | 16        | 切换到未交名单 / 下翻页 |
 
 ---
 
 ## 依赖库
 
-Arduino IDE 库里搜下面两个装上：
+Arduino IDE 库管理器里装：
 
 - **Adafruit PN532** — by Adafruit
-- 内置 `SPI.h` 即可，TFT 驱动是自写的，不需要额外库
+- **LovyanGFX** — by lovyan03
+
+`SPI.h`、`SD.h`、`driver/gpio.h` 都是板载自带的。
 
 ---
 
 ## 编译烧录
 
-1. Arduino IDE → 开发板选 `ESP32S3 Dev Module`
-2. 打开 `sketch_sep6a.ino`，选择串口烧录
+1. Arduino IDE 开发板选 **ESP32S3 Dev Module**（参照根目录 `参数.xlsx` 的完整配置：16MB Flash、QIO 80MHz、USB CDC On Boot 启用等）
+2. 打开 `sketch_sep6a.ino` 编译烧录
 3. 打开 **串口监视器**，波特率 **115200**
 
----
-
-## 使用方法
-
-### 读卡模式（默认）
-
-开机即为读卡模式，屏幕显示 `READY`，把卡靠近 PN532：
-
-- 屏幕显示 `CARD DETECTED!` + UID（十六进制逐字节）
-- 串口同步输出 UID
-- 同一张卡持续放置不会反复触发（内置去重）
-- 拿开卡 3 秒后自动回到待机界面
-
-### 写卡模式
-
-在串口监视器里输入 `w` 进入写卡模式：
-
-```
-w   → 进入写卡模式
-r   → 退出写卡模式，回到读卡
-```
-
-进入写卡模式后，把 NTAG 卡放上去，程序会自动：
-1. 识别 UID
-2. 逐页写入数据（每页 4 字节）
-3. 写成功屏幕显示绿色 `WRITE SUCCESS!` + UID
-4. 写失败显示红色提示（放新卡重试，或按 `r` 退出）
+> `font_cn.h` 约 770 KB 源码 / 120 KB flash，编译会慢一点，属正常现象。
 
 ---
 
-## 写卡配置
+## 使用流程
 
-在 `.ino` 文件顶部修改：
+### 第一次：登记学生
+
+1. SD 卡插好，上电。检测不到名单会自动进入**登记模式**
+2. 依次刷每个学生的贴纸，串口监视器输入 `name=张三`
+3. 全部录完输入 `d` 保存退出
+
+串口命令（登记模式下）：
+
+| 命令 | 作用 |
+|------|------|
+| `name=名字` | 给刚刷的贴纸命名并加入名单 |
+| `d` | 完成登记，保存到 SD 卡 |
+| `list` | 打印当前名单 |
+| `clear` | 清空名单 |
+
+### 日常：收作业
+
+| 操作 | 效果 |
+|------|------|
+| 刷作业本 | 登记，屏幕绿字"提交成功" + 进度条 |
+| 重复刷 | 黄字提示"这次已经交过了"，不会重复计数 |
+| 刷陌生卡 | 红字提示"未登记的卡"，并显示 UID |
+| 按 C | 查看未交名单，B/C 翻页 |
+| 全部交齐 | 自动跳到下一次作业 |
+| 按 A | 确认后手动开新作业 |
+| **长按 A** | 清空所有作业记录（名单保留） |
+
+### 串口模式切换（任何时候）
+
+| 命令 | 作用 |
+|------|------|
+| `s` | 进入登记模式 |
+| `w` | 进入 NTAG 写卡模式 |
+| `r` | 回到刷卡登记 |
+
+---
+
+## SD 卡上的文件
+
+| 文件 | 内容 |
+|------|------|
+| `/roster.csv` | `UID_HEX,姓名` 学生名单 |
+| `/state.csv` | 当前是第几次作业 |
+| `/hw_N.csv` | 第 N 次作业的提交记录（`姓名,UID,是否提交`） |
+
+直接拔卡插电脑就能导出名单做统计。
+
+---
+
+## 修改写卡内容
+
+在 `.ino` 顶部：
 
 ```cpp
-#define NTAG_START_PAGE  8       // 起始页（0-7 是 UID/厂商区，只读）
+#define NTAG_START_PAGE  8       // 起始页（0-3 是 UID 区，别动）
 #define NTAG_PAGE_COUNT  16      // 总共写多少页
 
 const uint8_t WRITE_DATA[] = "HELLO-RFID-TEST-!";  // 要写入的内容
 ```
-
-### NTAG 容量参考
 
 | 型号 | 用户页范围 |
 |------|-----------|
@@ -100,27 +153,44 @@ const uint8_t WRITE_DATA[] = "HELLO-RFID-TEST-!";  // 要写入的内容
 
 ---
 
-## 代码架构
+## 中文字库怎么改
+
+界面文字都是 16×16 点阵，字库由脚本生成，**收录 GB2312 一级汉字（3755 个）+ ASCII + 常用标点**，所以改 UI 里的文案不用重新生成字库——只要别用到生僻字。
+
+如果确实要加字：
+
+```bash
+cd tools
+pip install Pillow
+python gen_font_cn.py --preview font_preview.png
+```
+
+脚本会自动扫描 `.ino` 里出现过的所有汉字并补进字库，`font_preview.png` 可以先看一眼效果。默认用 `C:\Windows\Fonts\simhei.ttf`，想换字体加 `--font` 参数。
+
+---
+
+## 代码结构
 
 ```
 sketch_sep6a.ino
-├── 字库              极简 5×7 点阵，PROGMEM 存放
-├── TFT SPI 底层      纯 GPIO bit-bang（spiByte / tftCmd / tftDat）
-├── ST7789 绘图原语    fillColor / fillRect / drawPixel / drawFastHLine
-├── 文字渲染          drawChar / printStr / printNum
-├── ST7789 初始化     标准 init sequence
-├── UI 画面           showReady / showCard / showWriteMode / showWriteOK / showWriteFail
+├── 引脚定义          屏幕 / PN532 / SD / 按键
+├── 数据模型          Student 结构、提交位图 (50 人 × 30 次)
+├── 按键中断          gpio_get_level + esp_timer_get_time，IRAM 安全
+├── 存储层            SD 卡 CSV 读写（roster / state / hw_N）
+├── 字库引擎          font_cn.h + 二分查找 + drawGlyph/drawText
+├── 绘图原语          fillRect / drawFastHLine / printCentered / printRight
+├── UI 画面           刷卡 / 未交名单 / 登记 / 写卡 / 开新作业确认
 ├── performWrite      NTAG 写卡核心（逐页 ntag2xx_WritePage）
-└── loop()            状态机：读模式 / 写模式 + 串口命令解析
+└── loop()            状态机 + 串口命令解析
 ```
 
 ---
 
 ## 已知限制
 
-- TFT 驱动是 bit-bang，刷新速度不如硬件 SPI，但静态 UI 足够
 - 写卡仅支持 **NTAG** 系列（Ultralight 协议），Mifare Classic 写卡暂未加入
-- `performWrite` 内部不做即时回读验证（WritePage 返回 1 即视为写入成功）
+- `performWrite` 写完靠返回值判断，没做逐字节回读比对
+- 字库只收了 GB2312 一级汉字，姓名里出现生僻字会显示成方框
 
 ---
 

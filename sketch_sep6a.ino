@@ -1,4 +1,4 @@
-#define TFT_SCK    4
+﻿#define TFT_SCK    4
 #define TFT_MOSI   5
 #define TFT_RST    6
 #define TFT_DC     7
@@ -12,8 +12,29 @@
 #define PN532_IRQ  11
 #define PN532_RST  12
 
+#define BTN_NEXT  14
+#define BTN_UP    15
+#define BTN_DOWN  16
+
+#define SD_SCK    42
+#define SD_MISO   41
+#define SD_MOSI   40
+#define SD_CS     39
+
 #include <Adafruit_PN532.h>
+#include <LovyanGFX.hpp>
+#include <SPI.h>
+#include <SD.h>
+#include "driver/gpio.h"
+#include "esp_timer.h"
+
 Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
+
+// 屏幕走 SPI2_HOST(FSPI)，SD 卡必须走 SPI3_HOST(HSPI)。
+// 两者都用同一个 SPI 主机时，LovyanGFX 和 Arduino SD 库会各自调用
+// spi_bus_initialize() 争抢同一条总线，SD 卡会挂载失败或屏幕花屏。
+SPIClass sdSPI(HSPI);
+bool sdReady = false;
 
 // ============ 颜色 ============
 #define BLACK   0x0000
@@ -24,316 +45,768 @@ Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 #define CYAN    0x07FF
 #define YELLOW  0xFFE0
 
-// ============ 写卡配置 ============
-// NTAG213: pages 0x04~0x28,  NTAG215: 0x04~0x7F,  NTAG216: 0x04~0xE1
-// 前 4 页是 UID/厂商数据，只读
+// ============ 数据模型 ============
+#define MAX_STUDENTS 50
+#define MAX_HOMEWORK 30
+#define BITS_PER_HW  7
+
+struct Student {
+  uint8_t uid[7];
+  uint8_t uidLen;
+  // 16 字节 = 5 个汉字（UTF-8 3 字节/字）+ 结束符。
+  // 原来是 12 字节，只能塞 3 个汉字，四个字的名字会被截断。
+  char name[16];
+};
+
+enum SystemMode { MODE_CHECKIN, MODE_MISSING, MODE_SETUP, MODE_WRITE, MODE_CONFIRM_NEW };
+SystemMode sysMode = MODE_CHECKIN;
+
+Student roster[MAX_STUDENTS];
+uint8_t studentCount = 0;
+uint8_t currentHW = 0;
+uint8_t submissions[MAX_HOMEWORK][BITS_PER_HW];
+
+// ============ 按钮（ISR 置标志，loop 里处理） ============
+volatile bool btnNextFlag = false;
+volatile bool btnUpFlag = false;
+volatile bool btnDownFlag = false;
+volatile unsigned long btnNextPressTime = 0;
+volatile bool btnNextLongPress = false;
+
+// 中断里不能调 digitalRead() / millis()：它们不在 IRAM 里，
+// flash 被占用时会崩。改用 gpio_get_level() 和 esp_timer_get_time()。
+static inline unsigned long isrMillis() { return (unsigned long)(esp_timer_get_time() / 1000ULL); }
+
+void IRAM_ATTR isrNext() {
+  static unsigned long last = 0;
+  unsigned long now = isrMillis();
+  if (now - last < 50) return;
+  last = now;
+  if (gpio_get_level((gpio_num_t)BTN_NEXT) == 0) {
+    btnNextPressTime = now;
+    btnNextLongPress = false;
+  } else if (btnNextPressTime > 0) {
+    unsigned long dur = now - btnNextPressTime;
+    if (dur > 1000) btnNextLongPress = true;
+    else if (dur > 30) btnNextFlag = true;
+    btnNextPressTime = 0;
+  }
+}
+void IRAM_ATTR isrUp() {
+  static unsigned long last = 0;
+  unsigned long now = isrMillis();
+  if (now - last < 200) return;
+  last = now;
+  if (gpio_get_level((gpio_num_t)BTN_UP) == 0) btnUpFlag = true;
+}
+void IRAM_ATTR isrDown() {
+  static unsigned long last = 0;
+  unsigned long now = isrMillis();
+  if (now - last < 200) return;
+  last = now;
+  if (gpio_get_level((gpio_num_t)BTN_DOWN) == 0) btnDownFlag = true;
+}
+
+// ============ 存储层 (SD Card CSV) ============
+bool initSD() {
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdReady = SD.begin(SD_CS, sdSPI, 4000000);
+  if (!sdReady) Serial0.println("SD init FAILED (no card?)");
+  else Serial0.println("SD card OK");
+  return sdReady;
+}
+
+void uidToHex(uint8_t *uid, uint8_t len, char *buf) {
+  buf[0] = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    if (i > 0) strcat(buf, " ");
+    char tmp[4];
+    snprintf(tmp, sizeof(tmp), "%02X", uid[i]);
+    strcat(buf, tmp);
+  }
+}
+
+void saveRoster() {
+  if (!sdReady) return;
+  File f = SD.open("/roster.csv", FILE_WRITE);
+  if (!f) { Serial0.println("Cannot write roster.csv"); return; }
+  f.println("# RFID CheckIn Roster");
+  f.println("# UID_HEX,NAME");
+  for (uint8_t i = 0; i < studentCount; i++) {
+    char uidStr[32];
+    uidToHex(roster[i].uid, roster[i].uidLen, uidStr);
+    f.print(uidStr); f.print(","); f.println(roster[i].name);
+  }
+  f.close();
+  Serial0.println("roster.csv saved");
+}
+
+void loadRoster() {
+  if (!sdReady) { studentCount = 0; return; }
+  if (!SD.exists("/roster.csv")) { studentCount = 0; return; }
+
+  File f = SD.open("/roster.csv", FILE_READ);
+  if (!f) { studentCount = 0; return; }
+  studentCount = 0;
+  while (f.available() && studentCount < MAX_STUDENTS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') continue;
+
+    int comma = line.indexOf(',');
+    if (comma <= 0) continue;
+    String uidPart = line.substring(0, comma);
+    String namePart = line.substring(comma + 1);
+
+    uint8_t uidBuf[7] = {0};
+    uint8_t uidLen = 0;
+    int idx = 0;
+    String token = "";
+    for (int i = 0; i < (int)uidPart.length(); i++) {
+      char c = uidPart[i];
+      if (c == ' ') {
+        if (token.length() == 2 && uidLen < 7) {
+          uidBuf[uidLen++] = (uint8_t)strtol(token.c_str(), NULL, 16);
+        }
+        token = "";
+      } else token += c;
+    }
+    if (token.length() == 2 && uidLen < 7) {
+      uidBuf[uidLen++] = (uint8_t)strtol(token.c_str(), NULL, 16);
+    }
+    if (uidLen == 0) continue;
+
+    memcpy(roster[studentCount].uid, uidBuf, uidLen);
+    roster[studentCount].uidLen = uidLen;
+    strncpy(roster[studentCount].name, namePart.c_str(), sizeof(roster[studentCount].name) - 1);
+    roster[studentCount].name[sizeof(roster[studentCount].name) - 1] = 0;
+    studentCount++;
+  }
+  f.close();
+  Serial0.printf("Loaded %d students from SD\n", studentCount);
+}
+
+void saveAllHomework() {
+  if (!sdReady) return;
+  File sf = SD.open("/state.csv", FILE_WRITE);
+  if (sf) {
+    sf.print("current_hw="); sf.println(currentHW);
+    sf.close();
+  }
+  for (uint8_t h = 0; h <= currentHW; h++) {
+    char path[24];
+    snprintf(path, sizeof(path), "/hw_%d.csv", h + 1);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) continue;
+    f.printf("# HW %d Submissions\n", h + 1);
+    f.println("# NAME,UID,SUBMITTED");
+    for (uint8_t i = 0; i < studentCount; i++) {
+      char uidStr[32];
+      uidToHex(roster[i].uid, roster[i].uidLen, uidStr);
+      f.print(roster[i].name); f.print(","); f.print(uidStr); f.print(",");
+      f.println(isSubmitted(h, i) ? "1" : "0");
+    }
+    f.close();
+  }
+}
+
+void loadAllHomework() {
+  if (!sdReady) { currentHW = 0; return; }
+  currentHW = 0;
+  memset(submissions, 0, sizeof(submissions));
+
+  if (SD.exists("/state.csv")) {
+    File sf = SD.open("/state.csv", FILE_READ);
+    if (sf) {
+      String line = sf.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("current_hw=")) {
+        currentHW = (uint8_t)line.substring(11).toInt();
+        if (currentHW >= MAX_HOMEWORK) currentHW = 0;
+      }
+      sf.close();
+    }
+  }
+
+  for (uint8_t h = 0; h <= currentHW; h++) {
+    char path[24];
+    snprintf(path, sizeof(path), "/hw_%d.csv", h + 1);
+    if (!SD.exists(path)) continue;
+    File f = SD.open(path, FILE_READ);
+    if (!f) continue;
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0 || line[0] == '#') continue;
+      int lastComma = line.lastIndexOf(',');
+      if (lastComma < 0) continue;
+      String submittedStr = line.substring(lastComma + 1);
+      int comma2 = line.lastIndexOf(',', lastComma - 1);
+      if (comma2 < 0) continue;
+      String uidPart = line.substring(comma2 + 1, lastComma);
+
+      uint8_t uidBuf[7] = {0};
+      uint8_t uidLen = 0;
+      String token = "";
+      for (int i = 0; i < (int)uidPart.length(); i++) {
+        char c = uidPart[i];
+        if (c == ' ') {
+          if (token.length() == 2 && uidLen < 7) {
+            uidBuf[uidLen++] = (uint8_t)strtol(token.c_str(), NULL, 16);
+          }
+          token = "";
+        } else token += c;
+      }
+      if (token.length() == 2 && uidLen < 7) {
+        uidBuf[uidLen++] = (uint8_t)strtol(token.c_str(), NULL, 16);
+      }
+
+      int idx = findStudent(uidBuf, uidLen);
+      if (idx >= 0 && submittedStr == "1") {
+        uint8_t byteIdx = idx / 8;
+        uint8_t bitIdx = idx % 8;
+        submissions[h][byteIdx] |= (1 << bitIdx);
+      }
+    }
+    f.close();
+  }
+  Serial0.printf("Loaded HW state: current=%d\n", currentHW + 1);
+}
+
+void saveCurrentHWFile() {
+  if (!sdReady) return;
+  char path[24];
+  snprintf(path, sizeof(path), "/hw_%d.csv", currentHW + 1);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return;
+  f.printf("# HW %d Submissions\n", currentHW + 1);
+  f.println("# NAME,UID,SUBMITTED");
+  for (uint8_t i = 0; i < studentCount; i++) {
+    char uidStr[32];
+    uidToHex(roster[i].uid, roster[i].uidLen, uidStr);
+    f.print(roster[i].name); f.print(","); f.print(uidStr); f.print(",");
+    f.println(isSubmitted(currentHW, i) ? "1" : "0");
+  }
+  f.close();
+}
+
+// ============ 辅助函数 ============
+int findStudent(uint8_t *uid, uint8_t len) {
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (roster[i].uidLen != len) continue;
+    if (memcmp(roster[i].uid, uid, len) == 0) return i;
+  }
+  return -1;
+}
+
+bool isSubmitted(uint8_t hw, uint8_t stuIdx) {
+  if (hw >= MAX_HOMEWORK) return false;
+  uint8_t byteIdx = stuIdx / 8;
+  uint8_t bitIdx = stuIdx % 8;
+  return (submissions[hw][byteIdx] >> bitIdx) & 1;
+}
+
+void markSubmitted(uint8_t hw, uint8_t stuIdx) {
+  if (hw >= MAX_HOMEWORK) return;
+  uint8_t byteIdx = stuIdx / 8;
+  uint8_t bitIdx = stuIdx % 8;
+  submissions[hw][byteIdx] |= (1 << bitIdx);
+  if (hw == currentHW) saveCurrentHWFile();
+}
+
+uint8_t getSubmittedCount(uint8_t hw) {
+  uint8_t cnt = 0;
+  for (uint8_t i = 0; i < studentCount; i++) {
+    if (isSubmitted(hw, i)) cnt++;
+  }
+  return cnt;
+}
+
+void nextHomework() {
+  if (currentHW + 1 < MAX_HOMEWORK) {
+    currentHW++;
+    memset(submissions[currentHW], 0, BITS_PER_HW);
+  }
+  saveAllHomework();
+}
+
+void resetAll() {
+  currentHW = 0;
+  for (uint8_t h = 0; h < MAX_HOMEWORK; h++) {
+    memset(submissions[h], 0, BITS_PER_HW);
+  }
+  saveAllHomework();
+}
+
+
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7789   _panel;
+  lgfx::Bus_SPI        _bus;
+  lgfx::Light_PWM      _light;
+public:
+  LGFX(void) {
+    auto bus = _bus.config();
+    bus.spi_host   = SPI2_HOST;
+    bus.spi_mode   = 0;
+    bus.freq_write = 40000000;
+    bus.freq_read  = 16000000;
+    bus.pin_sclk   = TFT_SCK;
+    bus.pin_mosi   = TFT_MOSI;
+    bus.pin_miso   = -1;
+    bus.pin_dc     = TFT_DC;
+    bus.use_lock   = false;
+    _bus.config(bus);
+    _panel.setBus(&_bus);
+
+    auto p = _panel.config();
+    p.pin_cs       = TFT_CS;
+    p.pin_rst      = TFT_RST;
+    p.pin_busy     = -1;
+    p.memory_width = 240;
+    p.memory_height= 320;
+    p.panel_width  = 240;
+    p.panel_height = 240;
+    p.offset_x     = 0;
+    p.offset_y     = 0;
+    p.invert       = false;
+    p.rgb_order    = false;
+    p.readable     = false;
+    _panel.config(p);
+
+    auto light = _light.config();
+    light.pin_bl = TFT_BLK;
+    light.invert = false;
+    light.freq   = 44100;
+    light.pwm_channel = 7;
+    _light.config(light);
+    _panel.setLight(&_light);
+
+    setPanel(&_panel);
+  }
+};
+
+static LGFX lcd;
+
+// ============ 内置 16x16 点阵字库 ============
+// 不再走 LovyanGFX 的 loadFont()：它的第二个参数是字体类型枚举
+// （默认 ft_vlw），传 TTF 路径或长度进去根本加载不出来，而且还要依赖 SD 卡。
+// 现在字形直接编译进 flash，SD 卡拔了中文照样显示。
+#include "font_cn.h"
+
+// 在升序码点表里二分查找汉字，返回字形下标；找不到返回 -1
+static int cjkIndex(uint16_t code) {
+  int lo = 0, hi = (int)FONT_CN_CJK_COUNT - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) >> 1;
+    uint16_t c = font_cjk_codes[mid];
+    if (c == code) return mid;
+    if (c < code) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
+
+// 画一个字符；返回它占的宽度（ASCII 8px，汉字 16px）
+static int drawGlyph(int16_t x, int16_t y, uint16_t code, uint16_t fg, uint16_t bg) {
+  uint16_t buf[FONT_CN_CJK_W * FONT_CN_HEIGHT];
+
+  if (code >= 0x20 && code <= 0x7E) {
+    const uint8_t *bmp = font_ascii[code - 0x20];
+    for (int r = 0; r < FONT_CN_HEIGHT; r++) {
+      uint8_t bits = bmp[r];
+      for (int c = 0; c < FONT_CN_ASCII_W; c++)
+        buf[r * FONT_CN_ASCII_W + c] = (bits & (0x80 >> c)) ? fg : bg;
+    }
+    lcd.pushImage(x, y, FONT_CN_ASCII_W, FONT_CN_HEIGHT, buf);
+    return FONT_CN_ASCII_W;
+  }
+
+  int idx = cjkIndex(code);
+  if (idx < 0) {
+    // 字库没这个字，画个方框提示，别静默留空白
+    lcd.fillRect(x, y, FONT_CN_CJK_W, FONT_CN_HEIGHT, bg);
+    lcd.drawRect(x, y, FONT_CN_CJK_W, FONT_CN_HEIGHT, fg);
+    return FONT_CN_CJK_W;
+  }
+
+  const uint8_t *bmp = font_cjk_bitmap[idx];
+  for (int r = 0; r < FONT_CN_HEIGHT; r++) {
+    uint16_t bits = ((uint16_t)bmp[r * 2] << 8) | bmp[r * 2 + 1];
+    for (int c = 0; c < FONT_CN_CJK_W; c++)
+      buf[r * FONT_CN_CJK_W + c] = (bits & (0x8000 >> c)) ? fg : bg;
+  }
+  lcd.pushImage(x, y, FONT_CN_CJK_W, FONT_CN_HEIGHT, buf);
+  return FONT_CN_CJK_W;
+}
+
+// 画 UTF-8 字符串，返回结束时的 x 坐标（便于接着画）
+static int drawText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg) {
+  int cx = x;
+  while (*s) {
+    unsigned char c = (unsigned char)*s;
+    uint32_t code;
+    int n;
+    if (c < 0x80)       { code = c & 0x7F; n = 1; }
+    else if ((c & 0xE0) == 0xC0) { code = c & 0x1F; n = 2; }
+    else if ((c & 0xF0) == 0xE0) { code = c & 0x0F; n = 3; }
+    else if ((c & 0xF8) == 0xF0) { code = c & 0x07; n = 4; }
+    else                 { code = '?'; n = 1; }
+    for (int i = 1; i < n; i++) {
+      if (!s[i]) break;
+      code = (code << 6) | (s[i] & 0x3F);
+    }
+    if (cx + FONT_CN_CJK_W > lcd.width()) break;
+    cx += drawGlyph(cx, y, (uint16_t)code, fg, bg);
+    s += n;
+  }
+  return cx;
+}
+
+// 量一段文字的像素宽度，用来做居中 / 右对齐
+static int textWidth(const char *s) {
+  int w = 0;
+  while (*s) {
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80)       { w += FONT_CN_ASCII_W; s += 1; }
+    else if ((c & 0xE0) == 0xC0) { w += FONT_CN_CJK_W; s += 2; }
+    else if ((c & 0xF0) == 0xE0) { w += FONT_CN_CJK_W; s += 3; }
+    else if ((c & 0xF8) == 0xF0) { w += FONT_CN_CJK_W; s += 4; }
+    else                 { w += FONT_CN_ASCII_W; s += 1; }
+  }
+  return w;
+}
+
+void st7789Init() {
+  lcd.init();
+  lcd.setRotation(0);
+  lcd.fillScreen(BLACK);
+  Serial0.printf("Built-in bitmap font: %d ASCII + %d CJK glyphs\n",
+                 FONT_CN_ASCII_COUNT, FONT_CN_CJK_COUNT);
+}
+
+void fillColor(uint16_t c) { lcd.fillScreen(c); }
+void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) {
+  if (x + w <= 0 || y + h <= 0 || x >= lcd.width() || y >= lcd.height()) return;
+  lcd.fillRect(x, y, w, h, c);
+}
+void drawPixel(int16_t x, int16_t y, uint16_t c) { lcd.drawPixel(x, y, c); }
+void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) { lcd.drawFastHLine(x, y, w, c); }
+
+uint16_t _fgColor = WHITE, _bgColor = BLACK;
+int16_t _cx = 0, _cy = 0;
+
+void setTextColor(uint16_t c) { _fgColor = c; }
+void setTextBackground(uint16_t c) { _bgColor = c; }
+void setCursor(int16_t x, int16_t y) { _cx = x; _cy = y; }
+void printStr(const char *s) { _cx = drawText(_cx, _cy, s, _fgColor, _bgColor); }
+void printNum(uint32_t n, int base = 10) {
+  char b[12];
+  if (base == 16) snprintf(b, sizeof(b), "%X", n);
+  else snprintf(b, sizeof(b), "%u", n);
+  printStr(b);
+}
+// 居中画一行（y 为行顶），返回占用的宽度
+int printCentered(int16_t y, const char *s) {
+  int w = textWidth(s);
+  int x = (lcd.width() - w) / 2;
+  if (x < 0) x = 0;
+  drawText(x, y, s, _fgColor, _bgColor);
+  return w;
+}
+// 右对齐，右边距 pad
+int printRight(int16_t y, const char *s, int16_t pad) {
+  int w = textWidth(s);
+  int x = lcd.width() - w - pad;
+  if (x < 0) x = 0;
+  drawText(x, y, s, _fgColor, _bgColor);
+  return w;
+}
+
+// ============ UI ============
+enum ViewMode { VIEW_CHECKIN, VIEW_MISSING };
+ViewMode currentView = VIEW_CHECKIN;
+uint8_t missingPage = 0;
+
+#define HEADER_H 22   // 顶栏高度，16px 字高 + 上下各 3px 留白
+
+void drawHeader() {
+  fillRect(0, 0, 240, HEADER_H, BLUE);
+  setTextBackground(BLUE);          // 点阵要填背景色，顶栏上必须跟蓝底一致
+  setTextColor(WHITE);
+  setCursor(4, 3);
+  printStr("作业");
+  printNum(currentHW + 1);
+
+  char right[16];
+  snprintf(right, sizeof(right), "%d/%d", getSubmittedCount(currentHW), studentCount);
+  printRight(3, right, 6);
+
+  setTextBackground(BLACK);
+}
+
+void showCheckInView() {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+  drawHeader();
+  drawFastHLine(0, HEADER_H, 240, CYAN);
+
+  setTextColor(CYAN);
+  printCentered(66, "请刷卡登记");
+
+  char line[24];
+  snprintf(line, sizeof(line), "第 %d 次作业", currentHW + 1);
+  setTextColor(WHITE);
+  printCentered(96, line);
+
+  char cnt[24];
+  snprintf(cnt, sizeof(cnt), "已交 %d / %d", getSubmittedCount(currentHW), studentCount);
+  setTextColor(GREEN);
+  printCentered(138, cnt);
+
+  setTextColor(YELLOW);
+  setCursor(20, 202);  printStr("A开新");
+  setCursor(100, 202); printStr("B上翻");
+  setCursor(180, 202); printStr("C名单");
+}
+
+void showCheckInResult(int stuIdx, uint8_t *uid, uint8_t uidLen) {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+  drawHeader();
+  drawFastHLine(0, HEADER_H, 240, CYAN);
+
+  if (stuIdx < 0) {
+    setTextColor(RED);
+    printCentered(50, "未登记的卡");
+
+    char uidStr[32];
+    uidToHex(uid, uidLen, uidStr);
+    setTextColor(WHITE);
+    printCentered(85, uidStr);
+
+    setTextColor(YELLOW);
+    printCentered(145, "串口输入 s");
+    printCentered(168, "进入登记模式");
+    return;
+  }
+
+  setTextColor(WHITE);
+  printCentered(46, roster[stuIdx].name);
+
+  if (isSubmitted(currentHW, stuIdx)) {
+    setTextColor(YELLOW);
+    printCentered(80, "这次已经交过了");
+  } else {
+    markSubmitted(currentHW, stuIdx);
+    setTextColor(GREEN);
+    printCentered(80, "提交成功");
+  }
+
+  uint8_t submitted = getSubmittedCount(currentHW);
+  uint8_t pct = studentCount ? (submitted * 100 / studentCount) : 0;
+
+  // 进度条：外框 + 填充
+  lcd.drawRect(20, 116, 200, 12, WHITE);
+  uint16_t barW = (uint16_t)submitted * 196 / (studentCount ? studentCount : 1);
+  fillRect(22, 118, barW, 8, GREEN);
+
+  char prog[32];
+  snprintf(prog, sizeof(prog), "已交 %d/%d  %d%%", submitted, studentCount, pct);
+  setTextColor(WHITE);
+  printCentered(145, prog);
+
+  setTextColor(CYAN);
+  printCentered(180, "继续刷下一本");
+}
+
+void showMissingView() {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+
+  uint8_t missing[50];
+  uint8_t missingIdx = 0;
+  for (uint8_t i = 0; i < studentCount && missingIdx < 50; i++) {
+    if (!isSubmitted(currentHW, i)) missing[missingIdx++] = i;
+  }
+
+  fillRect(0, 0, 240, HEADER_H, RED);
+  setTextBackground(RED);
+  setTextColor(WHITE);
+  setCursor(4, 3); printStr("未交名单");
+  char right[16];
+  snprintf(right, sizeof(right), "%d人", missingIdx);
+  printRight(3, right, 6);
+  setTextBackground(BLACK);
+  drawFastHLine(0, HEADER_H, 240, RED);
+
+  if (missingIdx == 0) {
+    setTextColor(GREEN);
+    printCentered(100, "全部交齐！");
+    setTextColor(CYAN);
+    printCentered(140, "按 A 开新作业");
+    return;
+  }
+
+  const uint8_t perPage = 10;      // 16px 字高，一屏最多 10 行
+  uint8_t totalPages = (missingIdx + perPage - 1) / perPage;
+  if (missingPage >= totalPages) missingPage = totalPages - 1;
+
+  uint8_t start = missingPage * perPage;
+  uint8_t end = start + perPage;
+  if (end > missingIdx) end = missingIdx;
+
+  int row = 28;
+  for (uint8_t i = start; i < end; i++) {
+    char num[8];
+    snprintf(num, sizeof(num), "%d.", i + 1);
+    setTextColor(CYAN);
+    setCursor(8, row); printStr(num);
+    setTextColor(WHITE);
+    printStr(" ");
+    printStr(roster[missing[i]].name);
+    row += 19;
+  }
+
+  char page[16];
+  snprintf(page, sizeof(page), "%d/%d", missingPage + 1, totalPages);
+  setTextColor(YELLOW);
+  printRight(219, page, 8);
+}
+
+void showNewHWConfirm() {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+  setTextColor(YELLOW);
+  printCentered(38, "开始新作业？");
+  drawFastHLine(24, 62, 192, YELLOW);
+
+  char cur[24], nxt[24];
+  snprintf(cur, sizeof(cur), "当前：第 %d 次", currentHW + 1);
+  snprintf(nxt, sizeof(nxt), "新的：第 %d 次", currentHW + 2);
+  setTextColor(WHITE);
+  printCentered(82, cur);
+  setTextColor(CYAN);
+  printCentered(108, nxt);
+
+  setTextColor(GREEN);
+  printCentered(168, "A 键确认");
+  setTextColor(RED);
+  printCentered(196, "B 或 C 取消");
+}
+
+void showAllDone() {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+  setTextColor(GREEN);
+  printCentered(88, "全部交齐！");
+  char line[24];
+  snprintf(line, sizeof(line), "第 %d 次作业完成", currentHW + 1);
+  setTextColor(CYAN);
+  printCentered(130, line);
+}
+
+void showSetupMode() {
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+
+  fillRect(0, 0, 240, HEADER_H, YELLOW);
+  setTextBackground(YELLOW);
+  setTextColor(BLACK);
+  setCursor(4, 3); printStr("登记模式");
+  char right[16];
+  snprintf(right, sizeof(right), "%d人", studentCount);
+  printRight(3, right, 6);
+  setTextBackground(BLACK);
+  drawFastHLine(0, HEADER_H, 240, YELLOW);
+
+  setTextColor(WHITE);
+  printCentered(38, "刷一张新贴纸");
+  printCentered(60, "再串口输入姓名");
+
+  drawFastHLine(24, 88, 192, CYAN);
+  setTextColor(CYAN);
+  printCentered(98, "串口命令");
+
+  setTextColor(GREEN);
+  setCursor(24, 124); printStr("name=张三");
+  setCursor(24, 146); printStr("d 完成登记");
+  setCursor(24, 168); printStr("list 名单");
+  setTextColor(RED);
+  setCursor(24, 190); printStr("clear 清空");
+
+  setTextColor(YELLOW);
+  printCentered(216, "长按 A 会清空记录");
+}
+
+// ============ 写卡 UI + 逻辑（保留） ============
 #define NTAG_START_PAGE  8
 #define NTAG_PAGE_COUNT  16
-
 const uint8_t WRITE_DATA[] = "HELLO-RFID-TEST-!";
-
 bool writeMode = false;
 uint8_t writeLastUID[7] = {0};
 uint8_t writeLastLen = 0;
 
-// ============ 极简 5x7 字库 ============
-const uint8_t FONT5x7[][5] PROGMEM = {
-  {0x00,0x00,0x00,0x00,0x00}, // space 0
-  {0x3E,0x51,0x49,0x45,0x3E}, // 0      1
-  {0x00,0x42,0x7F,0x40,0x00}, // 1      2
-  {0x42,0x61,0x51,0x49,0x46}, // 2      3
-  {0x21,0x41,0x45,0x4B,0x31}, // 3      4
-  {0x18,0x14,0x12,0x7F,0x10}, // 4      5
-  {0x27,0x45,0x45,0x45,0x39}, // 5      6
-  {0x3C,0x4A,0x49,0x49,0x30}, // 6      7
-  {0x01,0x71,0x09,0x05,0x03}, // 7      8
-  {0x36,0x49,0x49,0x49,0x36}, // 8      9
-  {0x06,0x49,0x49,0x29,0x1E}, // 9      10
-  {0x3E,0x09,0x09,0x09,0x3E}, // A      11
-  {0x7F,0x49,0x49,0x49,0x36}, // B      12
-  {0x3E,0x41,0x41,0x41,0x22}, // C      13
-  {0x7F,0x41,0x41,0x22,0x1C}, // D      14
-  {0x7F,0x49,0x49,0x49,0x41}, // E      15
-  {0x7F,0x09,0x09,0x09,0x01}, // F      16
-  {0x3E,0x41,0x49,0x49,0x3A}, // G      17
-  {0x7F,0x08,0x08,0x08,0x7F}, // H      18
-  {0x00,0x41,0x7F,0x41,0x00}, // I      19
-  {0x20,0x40,0x41,0x3F,0x01}, // J      20
-  {0x7F,0x08,0x14,0x22,0x41}, // K      21
-  {0x7F,0x40,0x40,0x40,0x40}, // L      22
-  {0x7F,0x02,0x0C,0x02,0x7F}, // M      23
-  {0x7F,0x04,0x08,0x10,0x7F}, // N      24
-  {0x3E,0x41,0x41,0x41,0x3E}, // O      25
-  {0x7F,0x09,0x09,0x09,0x06}, // P      26
-  {0x3E,0x41,0x51,0x21,0x5E}, // Q      27
-  {0x7F,0x09,0x19,0x29,0x46}, // R      28
-  {0x46,0x49,0x49,0x49,0x31}, // S      29
-  {0x01,0x01,0x7F,0x01,0x01}, // T      30
-  {0x3F,0x40,0x40,0x40,0x3F}, // U      31
-  {0x1F,0x20,0x40,0x20,0x1F}, // V      32
-  {0x3F,0x40,0x38,0x40,0x3F}, // W      33
-  {0x63,0x14,0x08,0x14,0x63}, // X      34
-  {0x07,0x08,0x70,0x08,0x07}, // Y      35
-  {0x61,0x51,0x49,0x45,0x43}, // Z      36
-  {0x00,0x36,0x36,0x00,0x00}, // :      37
-  {0x00,0x00,0x00,0x30,0x30}, // .      38
-  {0x00,0x00,0x00,0x40,0x00}, // -      39
-  {0x40,0x30,0x08,0x06,0x01}, // /      40
-  {0x00,0x00,0x7F,0x00,0x00}, // |      41
-};
-
-uint8_t charIndex(char c) {
-  if (c == ' ') return 0;
-  if (c >= '0' && c <= '9') return 1 + (c - '0');
-  if (c >= 'A' && c <= 'Z') return 11 + (c - 'A');
-  if (c >= 'a' && c <= 'z') return 11 + (c - 'a');
-  if (c == ':') return 37;
-  if (c == '.') return 38;
-  if (c == '-') return 39;
-  if (c == '/') return 40;
-  if (c == '|') return 41;
-  return 0;
-}
-
-// ============ 纯 GPIO SPI (ST7789) ============
-void spiBit(uint8_t bit) {
-  digitalWrite(TFT_MOSI, bit);
-  digitalWrite(TFT_SCK, HIGH);
-  digitalWrite(TFT_SCK, LOW);
-}
-void spiByte(uint8_t data) {
-  for (int i = 7; i >= 0; i--) spiBit((data >> i) & 1);
-}
-void tftCmd(uint8_t cmd) {
-  digitalWrite(TFT_DC, LOW);
-  digitalWrite(TFT_CS, LOW);
-  spiByte(cmd);
-  digitalWrite(TFT_CS, HIGH);
-}
-void tftDat(uint8_t dat) {
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  spiByte(dat);
-  digitalWrite(TFT_CS, HIGH);
-}
-
-// ============ ST7789 底层 ============
-void setWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-  tftCmd(0x2A);
-  tftDat(x0 >> 8); tftDat(x0 & 0xFF);
-  tftDat(x1 >> 8); tftDat(x1 & 0xFF);
-  tftCmd(0x2B);
-  tftDat(y0 >> 8); tftDat(y0 & 0xFF);
-  tftDat(y1 >> 8); tftDat(y1 & 0xFF);
-  tftCmd(0x2C);
-}
-
-void fillColor(uint16_t color) {
-  setWindow(0, 0, 239, 239);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  for (uint32_t i = 0; i < 240UL * 240UL; i++) {
-    spiByte(color >> 8);
-    spiByte(color & 0xFF);
-  }
-  digitalWrite(TFT_CS, HIGH);
-}
-
-void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
-  if (x + w < 0 || y + h < 0 || x >= 240 || y >= 240) return;
-  setWindow(x, y, x + w - 1, y + h - 1);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  for (uint32_t i = 0; i < (uint32_t)w * h; i++) {
-    spiByte(color >> 8);
-    spiByte(color & 0xFF);
-  }
-  digitalWrite(TFT_CS, HIGH);
-}
-
-void drawPixel(int16_t x, int16_t y, uint16_t color) {
-  if (x < 0 || y < 0 || x >= 240 || y >= 240) return;
-  setWindow(x, y, x, y);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  spiByte(color >> 8);
-  spiByte(color & 0xFF);
-  digitalWrite(TFT_CS, HIGH);
-}
-
-void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t color) {
-  fillRect(x, y, w, 1, color);
-}
-
-// ============ 文字绘制 ============
-int16_t cursorX = 0, cursorY = 0;
-uint16_t fgColor = WHITE, bgColor = BLACK;
-
-void setTextColor(uint16_t c) { fgColor = c; }
-void setTextBackground(uint16_t c) { bgColor = c; }
-void setCursor(int16_t x, int16_t y) { cursorX = x; cursorY = y; }
-
-void drawChar(char c) {
-  uint8_t idx = charIndex(c);
-  for (uint8_t col = 0; col < 5; col++) {
-    uint8_t b = pgm_read_byte(&FONT5x7[idx][col]);
-    for (uint8_t row = 0; row < 7; row++) {
-      if (b & (1 << row)) drawPixel(cursorX + col, cursorY + row, fgColor);
-      else drawPixel(cursorX + col, cursorY + row, bgColor);
-    }
-  }
-  cursorX += 6;
-  if (cursorX > 234) { cursorX = 0; cursorY += 8; }
-}
-
-void printStr(const char *s) {
-  while (*s) drawChar(*s++);
-}
-
-void printNum(uint32_t n, int base = 10) {
-  char buf[12];
-  if (n == 0) drawChar('0');
-  else {
-    int i = 0;
-    while (n > 0) {
-      char c = (n % base < 10) ? ('0' + n % base) : ('A' + n % base - 10);
-      buf[i++] = c;
-      n /= base;
-    }
-    while (i > 0) drawChar(buf[--i]);
-  }
-}
-
-// ============ ST7789 初始化 ============
-void st7789Init() {
-  pinMode(TFT_SCK,  OUTPUT);
-  pinMode(TFT_MOSI, OUTPUT);
-  pinMode(TFT_CS,   OUTPUT);
-  pinMode(TFT_DC,   OUTPUT);
-  pinMode(TFT_RST,  OUTPUT);
-  pinMode(TFT_BLK,  OUTPUT);
-  digitalWrite(TFT_SCK, LOW);
-  digitalWrite(TFT_MOSI, LOW);
-  digitalWrite(TFT_CS, HIGH);
-  digitalWrite(TFT_DC, LOW);
-
-  digitalWrite(TFT_RST, LOW);
-  delay(20);
-  digitalWrite(TFT_RST, HIGH);
-  delay(150);
-
-  tftCmd(0x01); delay(150);
-  tftCmd(0x11); delay(150);
-  tftCmd(0x36); tftDat(0x00);
-  tftCmd(0x3A); tftDat(0x55);
-  tftCmd(0x21); delay(10);
-  tftCmd(0x29); delay(50);
-
-  digitalWrite(TFT_BLK, HIGH);
-  fillColor(BLACK);
-}
-
-// ============ UI ============
-void showReady() {
-  fillColor(BLACK);
-  setTextColor(WHITE);
-  setCursor(80, 30);  printStr("RFID");
-  setCursor(70, 40);  printStr("READER");
-  drawFastHLine(20, 55, 200, CYAN);
-  setTextColor(GREEN);
-  setCursor(90, 100); printStr("READY");
-  setTextColor(CYAN);
-  setCursor(40, 160); printStr("Place card");
-  setCursor(30, 170); printStr("near reader");
-}
-
-void showCard(uint8_t *uid, uint8_t len) {
-  fillColor(BLACK);
-  setTextColor(WHITE);
-  setCursor(80, 20);  printStr("RFID");
-  setCursor(70, 30);  printStr("READER");
-  drawFastHLine(20, 45, 200, CYAN);
-
-  setTextColor(GREEN);
-  setCursor(30, 60); printStr("CARD DETECTED!");
-
-  setTextColor(RED);
-  setCursor(20, 85); printStr("UID("); printNum(len); printStr("):");
-
-  setTextColor(WHITE);
-  int row = 100;
-  int col = 20;
-  for (uint8_t i = 0; i < len; i++) {
-    if (i == 3 || i == 5) {
-      row += 10;
-      col = 20;
-    }
-    setCursor(col, row);
-    uint8_t hi = (uid[i] >> 4) & 0xF;
-    uint8_t lo = uid[i] & 0xF;
-    drawChar(hi < 10 ? '0' + hi : 'A' + hi - 10);
-    drawChar(lo < 10 ? '0' + lo : 'A' + lo - 10);
-    drawChar(' ');
-    col += 14;
-  }
-}
-
-// ============ 写卡 UI + 逻辑 ============
 void showWriteMode() {
   fillColor(BLACK);
-  setTextColor(YELLOW);
-  setCursor(70, 20);  printStr("WRITE MODE");
-  drawFastHLine(20, 35, 200, YELLOW);
+  setTextBackground(BLACK);
+
+  fillRect(0, 0, 240, HEADER_H, YELLOW);
+  setTextBackground(YELLOW);
+  setTextColor(BLACK);
+  setCursor(4, 3); printStr("写卡模式");
+  setTextBackground(BLACK);
+  drawFastHLine(0, HEADER_H, 240, YELLOW);
+
   setTextColor(CYAN);
-  setCursor(20, 55);  printStr("NTAG CARD");
+  printCentered(46, "放上 NTAG 标签");
+
   setTextColor(WHITE);
-  setCursor(10, 100); printStr("Page:");
-  setCursor(110, 100); printNum(NTAG_START_PAGE);
-  setCursor(10, 115); printStr("Count:");
-  setCursor(110, 115); printNum(NTAG_PAGE_COUNT);
-  setCursor(10, 130); printStr("4B/page");
+  printCentered(90, "写入页  8");
+  printCentered(112, "页数 16");
+  printCentered(134, "每页 4 字节");
+
   setTextColor(GREEN);
-  setCursor(10, 170); printStr("'r' exit");
-  setCursor(10, 182); printStr("write mode");
+  printCentered(196, "r 退出写卡");
 }
 
 void showWriteOK(uint8_t *uid, uint8_t len) {
   fillColor(BLACK);
+  setTextBackground(BLACK);
+
   setTextColor(GREEN);
-  setCursor(60, 40);  printStr("WRITE");
-  setCursor(70, 50);  printStr("SUCCESS!");
+  printCentered(38, "写卡成功");
+
+  char uidStr[32];
+  uidToHex(uid, len, uidStr);
   setTextColor(WHITE);
-  setCursor(20, 80);  printStr("UID:");
-  for (uint8_t i = 0; i < len && i < 4; i++) {
-    setCursor(20 + i*40, 95);
-    uint8_t hi = (uid[i] >> 4) & 0xF, lo = uid[i] & 0xF;
-    drawChar(hi < 10 ? '0'+hi : 'A'+hi-10);
-    drawChar(lo < 10 ? '0'+lo : 'A'+lo-10);
-  }
+  printCentered(80, uidStr);
+
   setTextColor(CYAN);
-  setCursor(20, 140); printStr("Verified OK");
+  printCentered(130, "读回校验通过");
+
   setTextColor(YELLOW);
-  setCursor(10, 190); printStr("'r' exit / 'w' next");
+  printCentered(196, "r 退出    w 继续");
 }
 
 void showWriteFail(uint8_t reason) {
   fillColor(BLACK);
+  setTextBackground(BLACK);
+
   setTextColor(RED);
-  setCursor(65, 40);  printStr("WRITE");
-  setCursor(70, 50);  printStr("FAILED!");
+  printCentered(38, "写卡失败");
+
   setTextColor(WHITE);
-  if (reason == 0) {
-    setCursor(10, 80); printStr("Write cmd");
-    setCursor(10, 95); printStr("no response");
-  } else if (reason == 1) {
-    setCursor(10, 80); printStr("ACK missing");
-    setCursor(10, 95); printStr("after write");
-  } else {
-    setCursor(10, 80); printStr("Readback");
-    setCursor(10, 95); printStr("mismatch");
-  }
+  if (reason == 0)      printCentered(84, "写命令无响应");
+  else if (reason == 1) printCentered(84, "写入后无应答");
+  else                  printCentered(84, "读回数据不一致");
+
+  setTextColor(YELLOW);
+  printCentered(140, "标签拿开一点");
+  printCentered(162, "再重新放上去");
+
   setTextColor(GREEN);
-  setCursor(10, 190); printStr("'r' exit");
+  printCentered(200, "r 退出写卡");
 }
 
 bool performWrite(uint8_t *uid, uint8_t uidLen) {
@@ -361,11 +834,113 @@ bool performWrite(uint8_t *uid, uint8_t uidLen) {
 }
 
 // ============ 主程序 ============
+
+void enterMode(SystemMode m) {
+  sysMode = m;
+  switch (m) {
+    case MODE_CHECKIN: showCheckInView(); break;
+    case MODE_MISSING: showMissingView(); break;
+    case MODE_SETUP:   showSetupMode();   break;
+    case MODE_WRITE:   showWriteMode();   break;
+    case MODE_CONFIRM_NEW: showNewHWConfirm(); break;
+  }
+}
+
+void handleSerialSetup() {
+  static uint8_t setupUID[7] = {0};
+  static uint8_t setupUIDLen = 0;
+  static bool waitingForName = false;
+
+  while (Serial0.available()) {
+    char line[64];
+    uint8_t n = 0;
+    while (Serial0.available() && n < sizeof(line) - 1) {
+      char c = Serial0.read();
+      if (c == '\n' || c == '\r') break;
+      line[n++] = c;
+    }
+    line[n] = 0;
+    if (n == 0) continue;
+
+    if (strcmp(line, "d") == 0 || strcmp(line, "DONE") == 0) {
+      saveRoster();
+      saveAllHomework();
+      Serial0.printf("Setup done! %d students saved.\n", studentCount);
+      enterMode(MODE_CHECKIN);
+      return;
+    }
+    if (strcmp(line, "list") == 0) {
+      Serial0.println("Current roster:");
+      for (uint8_t i = 0; i < studentCount; i++) {
+        Serial0.printf("  %d. %s (UID:", i + 1, roster[i].name);
+        for (uint8_t k = 0; k < roster[i].uidLen; k++) {
+          Serial0.printf(" %02X", roster[i].uid[k]);
+        }
+        Serial0.println(")");
+      }
+    }
+    if (strncmp(line, "name=", 5) == 0) {
+      if (!waitingForName) {
+        Serial0.println("No card scanned yet! Scan a sticker first.");
+        continue;
+      }
+      if (studentCount >= MAX_STUDENTS) {
+        Serial0.println("Roster full!");
+        continue;
+      }
+      strncpy(roster[studentCount].name, line + 5, sizeof(roster[studentCount].name) - 1);
+      roster[studentCount].name[sizeof(roster[studentCount].name) - 1] = 0;
+      memcpy(roster[studentCount].uid, setupUID, setupUIDLen);
+      roster[studentCount].uidLen = setupUIDLen;
+      studentCount++;
+      saveRoster();
+      Serial0.printf("Saved: %d. %s\n", studentCount, roster[studentCount - 1].name);
+      waitingForName = false;
+      showSetupMode();
+    }
+    if (strcmp(line, "clear") == 0) {
+      studentCount = 0;
+      saveRoster();
+      Serial0.println("Roster cleared!");
+      showSetupMode();
+    }
+  }
+
+  uint8_t uid[7];
+  uint8_t uidLength;
+  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+  if (ok) {
+    static uint8_t lastUID[7] = {0};
+    static uint8_t lastLen = 0;
+    bool changed = (uidLength != lastLen);
+    if (!changed) for (uint8_t i = 0; i < uidLength; i++)
+      if (uid[i] != lastUID[i]) { changed = true; break; }
+
+    if (changed) {
+      int existing = findStudent(uid, uidLength);
+      if (existing >= 0) {
+        Serial0.printf("Already enrolled: %d. %s\n", existing + 1, roster[existing].name);
+      } else {
+        memcpy(setupUID, uid, uidLength);
+        setupUIDLen = uidLength;
+        waitingForName = true;
+        Serial0.print("Scanned new sticker! UID:");
+        for (uint8_t i = 0; i < uidLength; i++) Serial0.printf(" %02X", uid[i]);
+        Serial0.println();
+        Serial0.println("Type: name=YOUR_NAME");
+      }
+      memcpy(lastUID, uid, uidLength);
+      lastLen = uidLength;
+      delay(1500);
+    }
+  }
+}
+
 void setup(void) {
   Serial0.begin(115200);
   while (!Serial0) delay(10);
   delay(500);
-  Serial0.println("=== RFID Reader ===");
+  Serial0.println("=== RFID CheckIn ===");
 
   Serial0.println("Init ST7789...");
   st7789Init();
@@ -383,44 +958,84 @@ void setup(void) {
   if (!ver) {
     Serial0.println("ERROR: PN532 not found!");
     fillColor(RED);
+    setTextBackground(RED);
     setTextColor(WHITE);
-    setCursor(30, 100); printStr("ERROR");
-    setCursor(20, 120); printStr("PN532 not");
-    setCursor(20, 130); printStr("found");
+    printCentered(90, "找不到读卡模块");
+    printCentered(120, "检查 PN532 接线");
+    printCentered(150, "然后按复位键");
     while (1) delay(1000);
   }
   Serial0.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
   nfc.SAMConfig();
 
-  showReady();
-  Serial0.println("All ready! Waiting for card...");
-  Serial0.println("Commands:");
-  Serial0.println("  'w' -> enter WRITE MODE");
-  Serial0.println("  'r' -> return to READ MODE");
+  Serial0.println("Init buttons...");
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), isrNext, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_UP), isrUp, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_DOWN), isrDown, FALLING);
+
+  Serial0.println("Init SD...");
+  initSD();
+
+  Serial0.println("Loading storage...");
+  loadRoster();
+  loadAllHomework();
+  Serial0.printf("Students: %d, Current HW: %d\n", studentCount, currentHW + 1);
+
+  if (studentCount == 0) {
+    Serial0.println("No students enrolled. Starting setup...");
+    Serial0.println("Scan each sticker, then type: name=YOUR_NAME");
+    Serial0.println("Type 'd' when done, 'list' to see roster, 'clear' to reset.");
+    enterMode(MODE_SETUP);
+    return;
+  }
+
+  uint8_t submitted = getSubmittedCount(currentHW);
+  if (submitted == studentCount && studentCount > 0 && currentHW + 1 < MAX_HOMEWORK) {
+    enterMode(MODE_CONFIRM_NEW);
+  } else {
+    enterMode(MODE_CHECKIN);
+  }
+
+  Serial0.println("串口命令:");
+  Serial0.println("  s = setup mode (enroll)");
+  Serial0.println("  w = NTAG write mode");
+  Serial0.println("  r = normal mode");
 }
 
 void loop(void) {
-  while (Serial0.available()) {
-    char c = Serial0.read();
-    if (c == 'w' || c == 'W') {
-      writeMode = true;
-      writeLastLen = 0;
-      showWriteMode();
-      Serial0.println("-> WRITE MODE (place card)");
-    }
-    if (c == 'r' || c == 'R') {
-      writeMode = false;
-      writeLastLen = 0;
-      showReady();
-      Serial0.println("-> READ MODE");
+  // 长按 A 只在刷卡 / 未交名单 / 开新作业 这三个界面生效。
+  // 登记模式和写卡模式下必须忽略，否则登记学生时长按会直接清空整份名单。
+  if (btnNextLongPress) {
+    btnNextLongPress = false;
+    if (sysMode == MODE_CHECKIN || sysMode == MODE_MISSING || sysMode == MODE_CONFIRM_NEW) {
+      Serial0.println("Long press detected - reset all");
+      resetAll();
+      enterMode(MODE_CHECKIN);
+    } else {
+      Serial0.println("Long press ignored (not in checkin view)");
     }
   }
 
-  uint8_t uid[7];
-  uint8_t uidLength;
-  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+  if (sysMode == MODE_SETUP) {
+    handleSerialSetup();
+    return;
+  }
 
-  if (writeMode) {
+  if (sysMode == MODE_WRITE) {
+    while (Serial0.available()) {
+      char c = Serial0.read();
+      if (c == 'r' || c == 'R') {
+        writeMode = false;
+        enterMode(MODE_CHECKIN);
+        Serial0.println("-> CHECKIN MODE");
+      }
+    }
+    uint8_t uid[7];
+    uint8_t uidLength;
+    uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
     if (ok) {
       bool changed = (uidLength != writeLastLen);
       if (!changed) for (uint8_t i = 0; i < uidLength; i++)
@@ -434,13 +1049,8 @@ void loop(void) {
         }
         Serial0.println();
         bool res = performWrite(uid, uidLength);
-        if (res) {
-          showWriteOK(uid, uidLength);
-          Serial0.println("WRITE OK");
-        } else {
-          showWriteFail(1);
-          Serial0.println("WRITE FAIL (place card again to retry, or 'r' to exit)");
-        }
+        if (res) { showWriteOK(uid, uidLength); Serial0.println("WRITE OK"); }
+        else { Serial0.println("WRITE FAIL"); }
         memcpy(writeLastUID, uid, uidLength);
         writeLastLen = uidLength;
         delay(2000);
@@ -450,30 +1060,112 @@ void loop(void) {
     return;
   }
 
+  if (sysMode == MODE_CONFIRM_NEW) {
+    if (btnNextFlag) {
+      btnNextFlag = false;
+      nextHomework();
+      Serial0.printf("Started HW %d\n", currentHW + 1);
+      enterMode(MODE_CHECKIN);
+    }
+    if (btnUpFlag || btnDownFlag) {
+      btnUpFlag = false; btnDownFlag = false;
+      enterMode(MODE_CHECKIN);
+    }
+    return;
+  }
+
+  while (Serial0.available()) {
+    char c = Serial0.read();
+    if (c == 's' || c == 'S') {
+      enterMode(MODE_SETUP);
+      Serial0.println("-> SETUP MODE");
+    }
+    if (c == 'w' || c == 'W') {
+      writeMode = true;
+      writeLastLen = 0;
+      enterMode(MODE_WRITE);
+      Serial0.println("-> WRITE MODE");
+    }
+    if (c == 'r' || c == 'R') {
+      enterMode(MODE_CHECKIN);
+      Serial0.println("-> CHECKIN MODE");
+    }
+  }
+
+  if (btnNextFlag) {
+    btnNextFlag = false;
+    uint8_t submitted = getSubmittedCount(currentHW);
+    if (submitted == studentCount && studentCount > 0) {
+      if (currentHW + 1 < MAX_HOMEWORK) {
+        nextHomework();
+        Serial0.printf("Auto-advanced to HW %d (all submitted)\n", currentHW + 1);
+        showAllDone();
+        delay(1500);
+        enterMode(MODE_CHECKIN);
+      }
+    } else if (sysMode == MODE_CHECKIN) {
+      enterMode(MODE_CONFIRM_NEW);
+    } else if (sysMode == MODE_MISSING) {
+      missingPage = 0;
+      enterMode(MODE_CHECKIN);
+    }
+  }
+
+  if (btnUpFlag) {
+    btnUpFlag = false;
+    if (sysMode == MODE_MISSING && missingPage > 0) {
+      missingPage--;
+      showMissingView();
+    }
+  }
+
+  if (btnDownFlag) {
+    btnDownFlag = false;
+    if (sysMode == MODE_CHECKIN) {
+      missingPage = 0;
+      enterMode(MODE_MISSING);
+    } else if (sysMode == MODE_MISSING) {
+      missingPage++;
+      showMissingView();
+    }
+  }
+
+  if (sysMode != MODE_CHECKIN) return;
+
+  uint8_t uid[7];
+  uint8_t uidLength;
+  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+
   static uint8_t lastUID[7] = {0};
   static uint8_t lastLen = 0;
   if (ok) {
     bool changed = (uidLength != lastLen);
     if (!changed) for (uint8_t i = 0; i < uidLength; i++)
       if (uid[i] != lastUID[i]) { changed = true; break; }
+
     if (changed) {
-      showCard(uid, uidLength);
-      Serial0.print("UID: ");
-      for (uint8_t i = 0; i < uidLength; i++) {
-        if (uid[i] < 0x10) Serial0.print("0");
-        Serial0.print(uid[i], HEX);
-        Serial0.print(" ");
-      }
+      int idx = findStudent(uid, uidLength);
+      Serial0.printf("UID: ");
+      for (uint8_t i = 0; i < uidLength; i++) Serial0.printf("%02X ", uid[i]);
+      if (idx >= 0) Serial0.printf("-> %s", roster[idx].name);
+      else Serial0.print("-> UNKNOWN");
       Serial0.println();
+
+      showCheckInResult(idx, uid, uidLength);
       memcpy(lastUID, uid, uidLength);
       lastLen = uidLength;
       delay(1500);
+
+      uint8_t submitted = getSubmittedCount(currentHW);
+      if (submitted == studentCount && studentCount > 0 && currentHW + 1 < MAX_HOMEWORK) {
+        showAllDone();
+        delay(1500);
+        nextHomework();
+        Serial0.printf("Auto HW %d started\n", currentHW + 1);
+      }
+      enterMode(MODE_CHECKIN);
     }
   } else {
-    if (lastLen > 0) {
-      delay(3000);
-      lastLen = 0;
-      showReady();
-    }
+    lastLen = 0;
   }
 }
