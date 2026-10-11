@@ -12,7 +12,7 @@
 - **未交名单** —— 按 C 键随时翻看谁还没交，分页显示
 - **多次作业** —— 最多 30 次，全部交齐后自动进入下一次
 - **断电记忆** —— 名单和提交记录都写成 CSV 存在 SD 卡里，拔电重启接着用
-- **内置中文字库** —— 16×16 点阵字库编译进固件，不依赖 SD 卡字体文件
+- **中文双字库** —— SD 卡放 `font.vlw`（抗锯齿）优先，不插卡自动回退内置 16×16 点阵
 - **写卡模式** —— 保留 NTAG 写卡功能，用来批量给新标签写入标识
 
 ## 硬件接线
@@ -152,6 +152,7 @@ sim?             # 模拟刷一张未登记的卡
 
 | 文件 | 内容 |
 |------|------|
+| `/font.vlw` | 中文字库（可选，没有就用内置点阵） |
 | `/roster.csv` | `UID_HEX,姓名` 学生名单 |
 | `/state.csv` | 当前是第几次作业 |
 | `/hw_N.csv` | 第 N 次作业的提交记录（`姓名,UID,是否提交`） |
@@ -179,19 +180,56 @@ const uint8_t WRITE_DATA[] = "HELLO-RFID-TEST-!";  // 要写入的内容
 
 ---
 
-## 中文字库怎么改
+## 中文字库：vlw 优先，点阵兜底
 
-界面文字都是 16×16 点阵，字库由脚本生成，**收录 GB2312 一级汉字（3755 个）+ ASCII + 常用标点**，所以改 UI 里的文案不用重新生成字库——只要别用到生僻字。
+两种方案会自动选择，**SD 卡上有 `/font.vlw` 就用 vlw**：
 
-如果确实要加字：
+| 方案 | 条件 | 特点 |
+|------|------|------|
+| **SD 卡 vlw**（优先） | 卡根目录存在 `/font.vlw` | 8bit 抗锯齿灰度，观感最好；换字体/字号重新生成就行 |
+| **内置点阵**（兜底） | 没插卡 / 卡上没有 `/font.vlw` | 16×16 点阵编译进 flash，任何情况都能显示中文 |
+
+开机串口会打印用的是哪一套，类似：
+
+```
+Font: vlw loaded (/font.vlw), native line height=16, scale=1.00
+Font: no font.vlw on card, using built-in bitmap (95 ASCII + 3788 CJK)
+```
+
+### ⚠️ 为什么放的是 .vlw 而不是 .ttf
+
+LovyanGFX 的 TTF 解码器在官方仓库的**可选文件** `lgfx_ttffont.hpp` 里，
+Arduino 库管理器装的发行版**没有它**。没有它时，库把所有字体文件一律按
+VLW 格式解析（见 `lgfx_fonts.cpp` 里的 `#ifdef LGFX_TTFFONT_HPP_`），
+往卡里塞 `.ttf` 只会加载失败或显示乱码。
+
+`.vlw` 本来就是「用任意 TTF 在电脑上预渲染出来的字体文件」——
+想换微软雅黑、思源黑体等任何字体，改一下生成脚本的 `--font` 参数即可，
+效果等同于矢量字体。
+
+### 生成字库
 
 ```bash
 cd tools
 pip install Pillow
 python gen_font_cn.py --preview font_preview.png
+# 或者直接写进 SD 卡：python gen_font_cn.py --vlw E:\font.vlw
 ```
 
-脚本会自动扫描 `.ino` 里出现过的所有汉字并补进字库，`font_preview.png` 可以先看一眼效果。默认用 `C:\Windows\Fonts\simhei.ttf`，想换字体加 `--font` 参数。
+脚本一次产出两个文件：
+
+- `font.vlw`（约 900 KB）→ 拷到 SD 卡根目录
+- `font_cn.h`（编译进 flash 的点阵兜底，约 120 KB flash）
+
+字符集自动包含：ASCII + GB2312 一级汉字（3755 个）+ 常用标点 +
+**扫描 `.ino` 源码里出现过的所有汉字**（以后改 UI 文案也不怕缺字）。
+默认源字体 `C:\Windows\Fonts\simhei.ttf`，想换加 `--font` 参数；
+字号默认自动选到 16px 行高以内，想指定用 `--size`。
+生成后可以用 `verify_vlw.py` 离线渲染检查（它完全照抄库里的解析算法）：
+
+```bash
+python verify_vlw.py ../font.vlw vlw_check.png
+```
 
 ---
 
@@ -203,7 +241,7 @@ sketch_sep6a.ino
 ├── 数据模型          Student 结构、提交位图 (50 人 × 30 次)
 ├── 按键中断          gpio_get_level + esp_timer_get_time，IRAM 安全
 ├── 存储层            SD 卡 CSV 读写（roster / state / hw_N）
-├── 字库引擎          font_cn.h + 二分查找 + drawGlyph/drawText
+├── 字库引擎          SD 卡 vlw（抗锯齿）/ 内置 font_cn.h 点阵，自动切换
 ├── 绘图原语          fillRect / drawFastHLine / printCentered / printRight
 ├── UI 画面           刷卡 / 未交名单 / 登记 / 写卡 / 开新作业确认
 ├── performWrite      NTAG 写卡核心（逐页 ntag2xx_WritePage）

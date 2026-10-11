@@ -392,11 +392,30 @@ public:
 
 static LGFX lcd;
 
-// ============ 内置 16x16 点阵字库 ============
-// 不再走 LovyanGFX 的 loadFont()：它的第二个参数是字体类型枚举
-// （默认 ft_vlw），传 TTF 路径或长度进去根本加载不出来，而且还要依赖 SD 卡。
-// 现在字形直接编译进 flash，SD 卡拔了中文照样显示。
+// ============ 字库 ============
+// 两套方案，SD 卡上的字库优先，找不到就回退内置点阵：
+//   1. SD 卡 /font.vlw —— 8bit 抗锯齿灰度，观感最好
+//   2. 内置 16x16 点阵（font_cn.h）—— 编译进 flash，不插卡也能显示中文
+//
+// ⚠️ 为什么 SD 卡上放的是 .vlw 而不是 .ttf：
+//    LovyanGFX 的 TTF 解码器在官方仓库的可选文件 lgfx_ttffont.hpp 里，
+//    库管理器装的发行版没有它。没有它时 load_font() 把所有文件都当
+//    VLW 解析（看 lgfx_fonts.cpp 的 #ifdef LGFX_TTFFONT_HPP_），
+//    塞个 .ttf 进去只会解析失败或显示乱码。
+//    .vlw 本来就是"用任意 TTF 预渲染出来的字体文件"，
+//    由 tools/gen_font_cn.py 从 SimHei 等字体生成（15px / 行高 16）。
+//
+// ⚠️ 关键：loadFont() 的第二个参数是"字体格式枚举"，不是字号！
+//    旧代码写成 loadFont("/font.ttf", 16) 是把 16 当格式传，编译都过不了。
 #include "font_cn.h"
+
+// true  = 走 lcd.print()，用 SD 卡上的 vlw 字库
+// false = 走自绘 drawText()，用内置点阵字库
+bool useTTF = false;
+
+// 目标行高。vlw 按 15px 生成（ascent 13 + descent 3 = 16），
+// 内置点阵也是 16；万一卡里放了别的字号的 vlw，initFont() 会等比缩放。
+#define FONT_SIZE 16
 
 // 在升序码点表里二分查找汉字，返回字形下标；找不到返回 -1
 static int cjkIndex(uint16_t code) {
@@ -469,6 +488,7 @@ static int drawText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t b
 
 // 量一段文字的像素宽度，用来做居中 / 右对齐
 static int textWidth(const char *s) {
+  if (useTTF) return lcd.textWidth(s);
   int w = 0;
   while (*s) {
     unsigned char c = (unsigned char)*s;
@@ -485,7 +505,39 @@ void st7789Init() {
   lcd.init();
   lcd.setRotation(0);
   lcd.fillScreen(BLACK);
-  Serial0.printf("Built-in bitmap font: %d ASCII + %d CJK glyphs\n",
+  lcd.setTextColor(WHITE, BLACK);
+  lcd.setFont(&fonts::Font0);
+}
+
+// 必须在 initSD() 之后调用：SD 卡上有没有字库到这时才知道
+void initFont() {
+  useTTF = false;
+
+  if (!sdReady) {
+    Serial0.println("Font: no SD card, fall back to built-in 16x16 bitmap");
+    return;
+  }
+
+  // 只认 vlw。loadFont() 没装 TTF 解码器时会把一切当 VLW 解析，
+  // 别放 .ttf/.otf 进卡，会乱码。
+  const char *cands[] = { "/font.vlw", nullptr };
+  for (int i = 0; cands[i]; i++) {
+    if (!SD.exists(cands[i])) continue;
+    Serial0.printf("Font: try %s...\n", cands[i]);
+    if (lcd.loadFont(SD, cands[i])) {
+      // setTextSize 是"倍率"不是像素！VLW 自带行高，按行高等比缩放到 FONT_SIZE，
+      // 这样就算以后重新生成了别的字号的 vlw，UI 的 16px 行距也不会乱。
+      float h = (float)lcd.fontHeight();
+      if (h > 1.0f) lcd.setTextSize((float)FONT_SIZE / h);
+      useTTF = true;
+      Serial0.printf("Font: vlw loaded (%s), native line height=%.0f, scale=%.2f\n",
+                     cands[i], h, (h > 1.0f) ? (float)FONT_SIZE / h : 1.0f);
+      return;
+    }
+    Serial0.println("Font: load failed");
+  }
+
+  Serial0.printf("Font: no font.vlw on card, using built-in bitmap (%d ASCII + %d CJK)\n",
                  FONT_CN_ASCII_COUNT, FONT_CN_CJK_COUNT);
 }
 
@@ -500,10 +552,22 @@ void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) { lcd.drawFastHL
 uint16_t _fgColor = WHITE, _bgColor = BLACK;
 int16_t _cx = 0, _cy = 0;
 
-void setTextColor(uint16_t c) { _fgColor = c; }
-void setTextBackground(uint16_t c) { _bgColor = c; }
-void setCursor(int16_t x, int16_t y) { _cx = x; _cy = y; }
-void printStr(const char *s) { _cx = drawText(_cx, _cy, s, _fgColor, _bgColor); }
+void setTextColor(uint16_t c) {
+  _fgColor = c;
+  if (useTTF) lcd.setTextColor(c, _bgColor);
+}
+void setTextBackground(uint16_t c) {
+  _bgColor = c;
+  if (useTTF) lcd.setTextColor(_fgColor, c);
+}
+void setCursor(int16_t x, int16_t y) {
+  _cx = x; _cy = y;
+  if (useTTF) lcd.setCursor(x, y);
+}
+void printStr(const char *s) {
+  if (useTTF) { lcd.print(s); return; }   // TTF：交给 LovyanGFX 渲染
+  _cx = drawText(_cx, _cy, s, _fgColor, _bgColor);
+}
 void printNum(uint32_t n, int base = 10) {
   char b[12];
   if (base == 16) snprintf(b, sizeof(b), "%X", n);
@@ -1001,6 +1065,7 @@ void setup(void) {
 
   Serial0.println("Init SD...");
   initSD();
+  initFont();          // 必须在 initSD() 之后
 
   Serial0.println("Loading storage...");
   loadRoster();
