@@ -31,6 +31,134 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 
+// ============ 串口控制台 ============
+// 板上没有指示灯，串口是唯一能看到"系统在干什么"的窗口，这块必须稳。
+//
+// 本机情况：**只有 UART0 能用**（USB-TTL 桥接在 GPIO44 收 / GPIO43 发）。
+//   Serial0 = HardwareSerial(0) = UART0，串口监视器连的就是它。
+//   Serial  = USB CDC（USB CDC On Boot=1 时是 HWCDCSerial），本板用不了。
+//
+// 三个已知的坑：
+//  1) Serial0.printf() 没被 HardwareSerial 重写，走的是 Print::printf ->
+//     vprintf -> stdout -> SDK 控制台，和 println 不是同一条路，容易混。
+//     所以这里自己实现 printf，保证所有输出走同一条路。
+//  2) 不能写 while (!Serial0) delay(10); —— USB CDC 那种"等主机连上"的行为
+//     会让没开监视器就上电的板子永远卡住，表现为"板子没反应"。
+//     所以 operator bool() 永远返回 true。
+//  3) 串口监视器行尾设成 "No line ending" 时，readStringUntil('\n') 会一直等。
+//     所以自己实现带超时的版本，收到什么算什么。
+//
+// 想同时开 USB CDC：把 LOG_MIRROR_USB 改成 1（收发都走两个口）。
+#define LOG_MIRROR_USB 0
+
+// 如果你的 USB-TTL 桥不是接在芯片默认的 GPIO44(收)/GPIO43(发)，
+// 把实际引脚填进来（RX 在前、TX 在后），-1 表示用默认值。
+// 例如桥接在 GPIO11/12 时：#define UART0_RX_PIN 11
+#define UART0_RX_PIN -1
+#define UART0_TX_PIN -1
+
+class DualConsole : public Print {
+public:
+  void begin(unsigned long baud) {
+#if UART0_RX_PIN >= 0 && UART0_TX_PIN >= 0
+    Serial0.begin(baud, SERIAL_8N1, UART0_RX_PIN, UART0_TX_PIN);
+#else
+    Serial0.begin(baud);
+#endif
+#if LOG_MIRROR_USB && ARDUINO_USB_CDC_ON_BOOT
+    Serial.begin(baud);
+#endif
+  }
+  void setTimeout(unsigned long t) { Serial0.setTimeout(t); }
+
+  // 永远 true。不能像 USB CDC 那样"等主机连上才 true"，
+  // 否则没开串口监视器就上电的板子会永远卡在 while (!串口) 上，表现为"没反应"。
+  operator bool() const { return true; }
+
+  size_t write(uint8_t c) override {
+    size_t n = Serial0.write(c);
+    usbPut((const char *)&c, 1);
+    return n;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t n = Serial0.write(buffer, size);
+    usbPut((const char *)buffer, size);
+    return n;
+  }
+
+  // 自己实现 printf：Print::printf 走 vprintf -> stdout，只会到 UART0
+  size_t printf(const char *format, ...) __attribute__((format(printf, 2, 3))) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, format);
+    int len = vsnprintf(buf, sizeof(buf), format, ap);
+    va_end(ap);
+    if (len < 0) return 0;
+    if (len > (int)sizeof(buf) - 1) len = (int)sizeof(buf) - 1;
+    return write((const uint8_t *)buf, (size_t)len);
+  }
+
+  int available() {
+    int n = Serial0.available();
+#if LOG_MIRROR_USB && ARDUINO_USB_CDC_ON_BOOT
+    n += Serial.available();
+#endif
+    return n;
+  }
+  int read() {
+    if (Serial0.available()) return Serial0.read();
+#if LOG_MIRROR_USB && ARDUINO_USB_CDC_ON_BOOT
+    if (Serial.available()) return Serial.read();
+#endif
+    return -1;
+  }
+
+  // 按行取命令：两个口的数据混在一起读，谁先来读谁。
+  // 没有换行也能用（超时就把已收到的返回），所以串口监视器
+  // 的行尾设置成 "No line ending" 也能敲命令。
+  String readStringUntil(char term) {
+    String s;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 150) {
+      int c = read();
+      if (c < 0) { delay(1); continue; }
+      if (c == term) break;
+      if (c == '\r') continue;
+      s += (char)c;
+      if (s.length() >= 120) break;
+    }
+    return s;
+  }
+
+  // loop() 里调一次：USB 枚举好之后把缓存的启动日志补发出去
+  void pump() {
+#if LOG_MIRROR_USB && ARDUINO_USB_CDC_ON_BOOT
+    if (usbLive) return;
+    if (!Serial) return;
+    usbLive = true;
+    if (bufLen > 0) {
+      Serial.write((const uint8_t *)buf, (size_t)bufLen);
+      bufLen = 0;
+    }
+#endif
+  }
+
+private:
+  static const int CAP = 2048;
+  char buf[CAP];
+  int bufLen = 0;
+  bool usbLive = false;
+
+  void usbPut(const char *s, size_t n) {
+#if LOG_MIRROR_USB && ARDUINO_USB_CDC_ON_BOOT
+    if (usbLive) { Serial.write((const uint8_t *)s, n); return; }
+    for (size_t i = 0; i < n && bufLen < CAP; i++) buf[bufLen++] = s[i];
+#endif
+  }
+};
+
+DualConsole LOG;
+
 Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 
 // 屏幕走 SPI2_HOST(FSPI)，SD 卡必须走 SPI3_HOST(HSPI)。
@@ -48,6 +176,10 @@ uint32_t nfcFwVer = 0;
 
 // 实际加载的 VLW 文件名（状态页要显示）
 char fontName[48] = "";
+
+// 心跳点：屏幕右下角的小方块，每 5 秒翻一次颜色。
+// 板上没有指示灯，这是"程序还活着"最直观的证据。
+bool beatToggle = false;
 
 // ============ 状态页（顶替不存在的指示灯） ============
 // 板子上没有 LED 时，"系统现在跑到哪一步了"只能靠屏幕和串口来判断。
@@ -152,8 +284,8 @@ void ledTick();
 bool initSD() {
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   sdReady = SD.begin(SD_CS, sdSPI, 4000000);
-  if (!sdReady) Serial0.println("SD init FAILED (no card?)");
-  else Serial0.println("SD card OK");
+  if (!sdReady) LOG.println("SD init FAILED (no card?)");
+  else LOG.println("SD card OK");
   return sdReady;
 }
 
@@ -170,7 +302,7 @@ void uidToHex(uint8_t *uid, uint8_t len, char *buf) {
 void saveRoster() {
   if (!sdReady) return;
   File f = SD.open("/roster.csv", FILE_WRITE);
-  if (!f) { Serial0.println("Cannot write roster.csv"); return; }
+  if (!f) { LOG.println("Cannot write roster.csv"); return; }
   f.println("# RFID CheckIn Roster");
   f.println("# UID_HEX,SID,NAME");
   for (uint8_t i = 0; i < studentCount; i++) {
@@ -181,7 +313,7 @@ void saveRoster() {
     f.println(roster[i].name);
   }
   f.close();
-  Serial0.println("roster.csv saved");
+  LOG.println("roster.csv saved");
 }
 
 void loadRoster() {
@@ -244,7 +376,7 @@ void loadRoster() {
     if (roster[i].sid == 0) needFix = true;
   }
   if (needFix) {
-    Serial0.println("Old roster format, assigning SIDs...");
+    LOG.println("Old roster format, assigning SIDs...");
     uint16_t s = 1;
     for (uint8_t i = 0; i < studentCount; i++) {
       if (roster[i].sid != 0) continue;
@@ -254,7 +386,7 @@ void loadRoster() {
     }
     saveRoster();
   }
-  Serial0.printf("Loaded %d students from SD\n", studentCount);
+  LOG.printf("Loaded %d students from SD\n", studentCount);
 }
 
 void saveAllHomework() {
@@ -341,7 +473,7 @@ void loadAllHomework() {
     }
     f.close();
   }
-  Serial0.printf("Loaded HW state: current=%d\n", currentHW + 1);
+  LOG.printf("Loaded HW state: current=%d\n", currentHW + 1);
 }
 
 void saveCurrentHWFile() {
@@ -579,22 +711,22 @@ void st7789Init() {
 
 // 列出 SD 卡根目录的文件（判断"卡上到底有什么"时很有用）
 void listSdFiles(const char *tag) {
-  Serial0.printf("%s\n", tag);
+  LOG.printf("%s\n", tag);
   File root = SD.open("/");
   if (!root || !root.isDirectory()) {
-    Serial0.println("  (打不开根目录)");
+    LOG.println("  (打不开根目录)");
     if (root) root.close();
     return;
   }
   int n = 0;
   for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    Serial0.printf("  %-24s %8lu B%s\n", f.name(), (unsigned long)f.size(),
+    LOG.printf("  %-24s %8lu B%s\n", f.name(), (unsigned long)f.size(),
                    f.isDirectory() ? "  [目录]" : "");
     n++;
     f.close();
   }
   root.close();
-  if (n == 0) Serial0.println("  (空)");
+  if (n == 0) LOG.println("  (空)");
 }
 
 // 判断一个文件是不是 VLW（不是的话多半是 .ttf 改名来的）
@@ -618,7 +750,7 @@ void initFont() {
   fontName[0] = 0;
 
   if (!sdReady) {
-    Serial0.println("Font: no SD card, fall back to built-in 16x16 bitmap");
+    LOG.println("Font: no SD card, fall back to built-in 16x16 bitmap");
     return;
   }
 
@@ -650,17 +782,17 @@ void initFont() {
   }
 
   if (path[0] == 0) {
-    Serial0.println("Font: no .vlw on card, using built-in bitmap");
+    LOG.println("Font: no .vlw on card, using built-in bitmap");
     listSdFiles("Font: 卡上现在的文件:");
-    Serial0.printf("Font: built-in bitmap (%d ASCII + %d CJK)\n",
+    LOG.printf("Font: built-in bitmap (%d ASCII + %d CJK)\n",
                    FONT_CN_ASCII_COUNT, FONT_CN_CJK_COUNT);
     return;
   }
 
-  Serial0.printf("Font: try %s...\n", path);
+  LOG.printf("Font: try %s...\n", path);
   if (!looksLikeVlw(path)) {
-    Serial0.println("Font: 这个文件不是 VLW 格式（可能是 .ttf 改了后缀）");
-    Serial0.println("Font: 请用 tools/gen_font_cn.py 生成真正的 font.vlw");
+    LOG.println("Font: 这个文件不是 VLW 格式（可能是 .ttf 改了后缀）");
+    LOG.println("Font: 请用 tools/gen_font_cn.py 生成真正的 font.vlw");
     listSdFiles("Font: 卡上现在的文件:");
     return;
   }
@@ -672,11 +804,11 @@ void initFont() {
     if (h > 1.0f) lcd.setTextSize((float)FONT_SIZE / h);
     useTTF = true;
     snprintf(fontName, sizeof(fontName), "%s", path);
-    Serial0.printf("Font: vlw loaded (%s), native line height=%.0f, scale=%.2f\n",
+    LOG.printf("Font: vlw loaded (%s), native line height=%.0f, scale=%.2f\n",
                    path, h, (h > 1.0f) ? (float)FONT_SIZE / h : 1.0f);
     return;
   }
-  Serial0.println("Font: load failed (文件损坏或字形表为空?)");
+  LOG.println("Font: load failed (文件损坏或字形表为空?)");
   listSdFiles("Font: 卡上现在的文件:");
 }
 
@@ -840,35 +972,40 @@ void showStatusView() {
   printCentered(210, "t 返回  h 帮助");
 }
 
+// 当前界面模式的名字
+const char *modeName() {
+  switch (sysMode) {
+    case MODE_CHECKIN:    return "刷卡登记";
+    case MODE_MISSING:    return "未交名单";
+    case MODE_SETUP:      return "登记模式";
+    case MODE_WRITE:      return "写卡模式";
+    case MODE_CONFIRM_NEW:return "确认开新作业";
+  }
+  return "?";
+}
+
 // 串口版状态报告，比屏幕上更详细
 void printStatus() {
-  Serial0.println("---- 系统状态 ----");
-  Serial0.printf("  屏幕      : OK  ST7789 240x240\n");
+  LOG.println("---- 系统状态 ----");
+  LOG.printf("  屏幕      : OK  ST7789 240x240\n");
   if (nfcReady) {
-    Serial0.printf("  读卡器    : OK  PN532 F/W %d.%d\n",
+    LOG.printf("  读卡器    : OK  PN532 F/W %d.%d\n",
                    (nfcFwVer >> 16) & 0xFF, (nfcFwVer >> 8) & 0xFF);
   } else {
-    Serial0.println("  读卡器    : 未找到 —— 检查接线 + 拨码开关(SPI 模式) + 断电重上电");
+    LOG.println("  读卡器    : 未找到 —— 检查接线 + 拨码开关(SPI 模式) + 断电重上电");
   }
-  Serial0.printf("  SD 卡     : %s\n", sdReady ? "OK" : "挂载失败 —— 检查接线/卡是否插好/是不是 FAT32");
-  if (useTTF) Serial0.printf("  字库      : %s（卡上）\n", fontName);
-  else Serial0.println("  字库      : 内置 16x16 点阵（卡上没有 .vlw）");
-  Serial0.printf("  学生      : %d 人\n", studentCount);
-  Serial0.printf("  当前作业  : 第 %d 次，已交 %d/%d\n",
+  LOG.printf("  SD 卡     : %s\n", sdReady ? "OK" : "挂载失败 —— 检查接线/卡是否插好/是不是 FAT32");
+  if (useTTF) LOG.printf("  字库      : %s（卡上）\n", fontName);
+  else LOG.println("  字库      : 内置 16x16 点阵（卡上没有 .vlw）");
+  LOG.printf("  学生      : %d 人\n", studentCount);
+  LOG.printf("  当前作业  : 第 %d 次，已交 %d/%d\n",
                  currentHW + 1, getSubmittedCount(currentHW), studentCount);
-  const char *m = "刷卡登记";
-  switch (sysMode) {
-    case MODE_CHECKIN:    m = "刷卡登记"; break;
-    case MODE_MISSING:    m = "未交名单"; break;
-    case MODE_SETUP:      m = "登记模式（刷卡 + name=姓名）"; break;
-    case MODE_WRITE:      m = "写卡模式（批量发编号）"; break;
-    case MODE_CONFIRM_NEW:m = "确认开新作业"; break;
-  }
-  Serial0.printf("  界面模式  : %s\n", m);
-  Serial0.printf("  运行      : 已启动 %lu 秒，空闲内存 %lu KB\n",
+  const char *m = modeName();
+  LOG.printf("  界面模式  : %s\n", m);
+  LOG.printf("  运行      : 已启动 %lu 秒，空闲内存 %lu KB\n",
                  millis() / 1000, ESP.getFreeHeap() / 1024);
-  Serial0.println("  提示      : t 状态页  h 帮助  probe 读卡器自检  list 名单");
-  Serial0.println("-------------------");
+  LOG.println("  提示      : t 状态页  h 帮助  probe 读卡器自检  list 名单");
+  LOG.println("-------------------");
 }
 
 // 可选状态灯。LED_PIN 配成实际 GPIO 号才生效（-1 = 关闭）。
@@ -1127,27 +1264,27 @@ bool readCardSid(uint16_t *sid) {
   if (!nfc.ntag2xx_ReadPage(NTAG_START_PAGE + 1, p1)) return false;
   delay(20);
 
-  Serial0.print("Card raw: ");
-  for (int i = 0; i < 4; i++) Serial0.printf("%02X ", p0[i]);
-  for (int i = 0; i < 4; i++) Serial0.printf("%02X ", p1[i]);
-  Serial0.println();
+  LOG.print("Card raw: ");
+  for (int i = 0; i < 4; i++) LOG.printf("%02X ", p0[i]);
+  for (int i = 0; i < 4; i++) LOG.printf("%02X ", p1[i]);
+  LOG.println();
 
   if (p0[0] != NTAG_MAGIC_P0 || p0[1] != NTAG_MAGIC_P1 ||
       p0[2] != NTAG_MAGIC_P2 || p0[3] != NTAG_MAGIC_P3) {
-    Serial0.println("  -> not our card (magic mismatch)");
+    LOG.println("  -> not our card (magic mismatch)");
     return false;
   }
   if (p1[0] != CARD_VERSION) {
-    Serial0.printf("  -> version %u, expect %u\n", p1[0], CARD_VERSION);
+    LOG.printf("  -> version %u, expect %u\n", p1[0], CARD_VERSION);
     return false;
   }
   if (xorSum(p0, 4) != 0 || p1[0] ^ p1[1] ^ p1[2] != p1[3]) {
-    Serial0.println("  -> CRC failed, card data corrupted");
+    LOG.println("  -> CRC failed, card data corrupted");
     return false;
   }
 
   *sid = ((uint16_t)p1[1] << 8) | p1[2];
-  Serial0.printf("  -> card sid=%u\n", *sid);
+  LOG.printf("  -> card sid=%u\n", *sid);
   return true;
 }
 
@@ -1159,7 +1296,7 @@ bool writeCardSid(uint16_t sid) {
   uint8_t p1[4] = {CARD_VERSION, (uint8_t)(sid >> 8), (uint8_t)(sid & 0xFF), 0};
   p1[3] = xorSum(p1, 3);
 
-  Serial0.printf("Write sid=%u (hi=%02X lo=%02X crc=%02X)\n",
+  LOG.printf("Write sid=%u (hi=%02X lo=%02X crc=%02X)\n",
                  sid, p1[1], p1[2], p1[3]);
 
   if (!nfc.ntag2xx_WritePage(NTAG_START_PAGE, p0)) return false;
@@ -1169,14 +1306,14 @@ bool writeCardSid(uint16_t sid) {
 
   uint16_t back = 0;
   if (!readCardSid(&back)) {
-    Serial0.println("  verify read failed");
+    LOG.println("  verify read failed");
     return false;
   }
   if (back != sid) {
-    Serial0.printf("  verify MISMATCH: wrote %u, read %u\n", sid, back);
+    LOG.printf("  verify MISMATCH: wrote %u, read %u\n", sid, back);
     return false;
   }
-  Serial0.println("  verify OK");
+  LOG.println("  verify OK");
   return true;
 }
 
@@ -1301,21 +1438,21 @@ void showWriteDone(uint8_t kind, uint16_t sid, uint8_t *uid, uint8_t len) {
 // ============ 主程序 ============
 
 void printSerialHelp() {
-  Serial0.println("---- 串口命令 ----");
-  Serial0.println("  n    = 按键A：开新作业 / 确认");
-  Serial0.println("  u    = 按键B：上翻页 / 取消");
-  Serial0.println("  m    = 按键C：未交名单 / 下翻页");
-  Serial0.println("  s    = 进入登记模式（刷卡 + name=姓名，自动发编号并写卡）");
-  Serial0.println("  w    = 进入写卡模式（批量发编号 / 补写卡）");
-  Serial0.println("  r    = 回到刷卡界面");
-  Serial0.println("  list = 查看名单（含编号）");
-  Serial0.println("  t    = 状态页：屏幕+串口看各模块运行状况（没有指示灯就看这个）");
-  Serial0.println("  ls   = 列出 SD 卡根目录的文件");
-  Serial0.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
-  Serial0.println("  sim=<姓名>   模拟刷某人的卡");
-  Serial0.println("  sim=<UID>    模拟刷指定 UID");
-  Serial0.println("  sim?         模拟刷一张陌生卡");
-  Serial0.println("  h    = 显示本帮助");
+  LOG.println("---- 串口命令 ----");
+  LOG.println("  n    = 按键A：开新作业 / 确认");
+  LOG.println("  u    = 按键B：上翻页 / 取消");
+  LOG.println("  m    = 按键C：未交名单 / 下翻页");
+  LOG.println("  s    = 进入登记模式（刷卡 + name=姓名，自动发编号并写卡）");
+  LOG.println("  w    = 进入写卡模式（批量发编号 / 补写卡）");
+  LOG.println("  r    = 回到刷卡界面");
+  LOG.println("  list = 查看名单（含编号）");
+  LOG.println("  t    = 状态页：屏幕+串口看各模块运行状况（没有指示灯就看这个）");
+  LOG.println("  ls   = 列出 SD 卡根目录的文件");
+  LOG.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
+  LOG.println("  sim=<姓名>   模拟刷某人的卡");
+  LOG.println("  sim=<UID>    模拟刷指定 UID");
+  LOG.println("  sim?         模拟刷一张陌生卡");
+  LOG.println("  h    = 显示本帮助");
 }
 
 void enterMode(SystemMode m) {
@@ -1331,7 +1468,7 @@ void enterMode(SystemMode m) {
       // 进来就把"下一个要发的编号"算好，写卡页要显示它
       writePendingSid = nextFreeSid();
       if (writePendingSid == 0) writePendingSid = MAX_STUDENTS;
-      Serial0.printf("Write mode, next free sid=%u\n", writePendingSid);
+      LOG.printf("Write mode, next free sid=%u\n", writePendingSid);
       showWriteMode();
       break;
     case MODE_CONFIRM_NEW: showNewHWConfirm(); break;
@@ -1343,11 +1480,11 @@ void handleSerialSetup() {
   static uint8_t setupUIDLen = 0;
   static bool waitingForName = false;
 
-  while (Serial0.available()) {
+  while (LOG.available()) {
     char line[64];
     uint8_t n = 0;
-    while (Serial0.available() && n < sizeof(line) - 1) {
-      char c = Serial0.read();
+    while (LOG.available() && n < sizeof(line) - 1) {
+      char c = LOG.read();
       if (c == '\n' || c == '\r') break;
       line[n++] = c;
     }
@@ -1357,18 +1494,18 @@ void handleSerialSetup() {
     if (strcmp(line, "d") == 0 || strcmp(line, "DONE") == 0) {
       saveRoster();
       saveAllHomework();
-      Serial0.printf("Setup done! %d students saved.\n", studentCount);
+      LOG.printf("Setup done! %d students saved.\n", studentCount);
       enterMode(MODE_CHECKIN);
       return;
     }
     if (strcmp(line, "list") == 0) {
-      Serial0.println("Current roster:");
+      LOG.println("Current roster:");
       for (uint8_t i = 0; i < studentCount; i++) {
-        Serial0.printf("  [%04u] %s (UID:", roster[i].sid, roster[i].name);
+        LOG.printf("  [%04u] %s (UID:", roster[i].sid, roster[i].name);
         for (uint8_t k = 0; k < roster[i].uidLen; k++) {
-          Serial0.printf(" %02X", roster[i].uid[k]);
+          LOG.printf(" %02X", roster[i].uid[k]);
         }
-        Serial0.println(")");
+        LOG.println(")");
       }
     }
     if (strcmp(line, "t") == 0 || strcmp(line, "T") == 0) {
@@ -1377,22 +1514,22 @@ void handleSerialSetup() {
       printStatus();
     }
     if (strcmp(line, "ls") == 0 || strcmp(line, "LS") == 0) {
-      if (!sdReady) Serial0.println("ls: SD 卡没挂上");
+      if (!sdReady) LOG.println("ls: SD 卡没挂上");
       else listSdFiles("---- SD 卡根目录 ----");
     }
     if (strncmp(line, "name=", 5) == 0) {
       if (!waitingForName) {
-        Serial0.println("No card scanned yet! Scan a sticker first.");
+        LOG.println("No card scanned yet! Scan a sticker first.");
         continue;
       }
       if (studentCount >= MAX_STUDENTS) {
-        Serial0.println("Roster full!");
+        LOG.println("Roster full!");
         continue;
       }
       // 自动分配下一个空闲编号
       uint16_t sid = nextFreeSid();
       if (sid == 0) {
-        Serial0.println("No free SID left!");
+        LOG.println("No free SID left!");
         continue;
       }
       strncpy(roster[studentCount].name, line + 5, sizeof(roster[studentCount].name) - 1);
@@ -1402,15 +1539,15 @@ void handleSerialSetup() {
       roster[studentCount].sid = sid;
       studentCount++;
       saveRoster();
-      Serial0.printf("Saved: [%04u] %s\n", roster[studentCount - 1].sid,
+      LOG.printf("Saved: [%04u] %s\n", roster[studentCount - 1].sid,
                      roster[studentCount - 1].name);
 
       // 顺手把这张卡的编号也写进去，省得再去写卡模式走一遍
       if (nfcReady) {
         if (writeCardSid(sid)) {
-          Serial0.printf("Card sid written and verified: %u\n", sid);
+          LOG.printf("Card sid written and verified: %u\n", sid);
         } else {
-          Serial0.printf("WARN: could not write sid to card, run 'w' mode to retry\n");
+          LOG.printf("WARN: could not write sid to card, run 'w' mode to retry\n");
         }
       }
       waitingForName = false;
@@ -1419,7 +1556,7 @@ void handleSerialSetup() {
     if (strcmp(line, "clear") == 0) {
       studentCount = 0;
       saveRoster();
-      Serial0.println("Roster cleared!");
+      LOG.println("Roster cleared!");
       showSetupMode();
     }
   }
@@ -1439,15 +1576,15 @@ void handleSerialSetup() {
     if (changed) {
       int existing = findStudent(uid, uidLength);
       if (existing >= 0) {
-        Serial0.printf("Already enrolled: %d. %s\n", existing + 1, roster[existing].name);
+        LOG.printf("Already enrolled: %d. %s\n", existing + 1, roster[existing].name);
       } else {
         memcpy(setupUID, uid, uidLength);
         setupUIDLen = uidLength;
         waitingForName = true;
-        Serial0.print("Scanned new sticker! UID:");
-        for (uint8_t i = 0; i < uidLength; i++) Serial0.printf(" %02X", uid[i]);
-        Serial0.println();
-        Serial0.println("Type: name=YOUR_NAME");
+        LOG.print("Scanned new sticker! UID:");
+        for (uint8_t i = 0; i < uidLength; i++) LOG.printf(" %02X", uid[i]);
+        LOG.println();
+        LOG.println("Type: name=YOUR_NAME");
       }
       memcpy(lastUID, uid, uidLength);
       lastLen = uidLength;
@@ -1457,17 +1594,16 @@ void handleSerialSetup() {
 }
 
 void setup(void) {
-  Serial0.begin(115200);
-  Serial0.setTimeout(50);        // 串口命令按行读，别让 loop 卡在等换行上
-  while (!Serial0) delay(10);
+  LOG.begin(115200);
+  LOG.setTimeout(50);        // 串口命令按行读，别让 loop 卡在等换行上
   delay(500);
-  Serial0.println("=== RFID CheckIn ===");
+  LOG.println("=== RFID CheckIn ===");
 
-  Serial0.println("Init ST7789...");
+  LOG.println("Init ST7789...");
   st7789Init();
-  Serial0.println("ST7789 OK");
+  LOG.println("ST7789 OK");
 
-  Serial0.println("Init PN532...");
+  LOG.println("Init PN532...");
   pinMode(PN532_RST, OUTPUT);
   digitalWrite(PN532_RST, LOW);
   delay(100);
@@ -1477,17 +1613,17 @@ void setup(void) {
 
   uint32_t ver = nfc.getFirmwareVersion();
   if (!ver) {
-    Serial0.println("WARN: PN532 not found - running WITHOUT reader");
-    Serial0.println("      Use 'sim=<name>' to simulate a scan.");
+    LOG.println("WARN: PN532 not found - running WITHOUT reader");
+    LOG.println("      Use 'sim=<name>' to simulate a scan.");
     nfcReady = false;
   } else {
-    Serial0.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
+    LOG.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
     nfcFwVer = ver;
     nfc.SAMConfig();
     nfcReady = true;
   }
 
-  Serial0.println("Init buttons...");
+  LOG.println("Init buttons...");
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
@@ -1500,19 +1636,19 @@ void setup(void) {
   digitalWrite(LED_PIN, LOW);
 #endif
 
-  Serial0.println("Init SD...");
+  LOG.println("Init SD...");
   initSD();
   initFont();          // 必须在 initSD() 之后
 
-  Serial0.println("Loading storage...");
+  LOG.println("Loading storage...");
   loadRoster();
   loadAllHomework();
-  Serial0.printf("Students: %d, Current HW: %d\n", studentCount, currentHW + 1);
+  LOG.printf("Students: %d, Current HW: %d\n", studentCount, currentHW + 1);
 
   if (studentCount == 0) {
-    Serial0.println("No students enrolled. Starting setup...");
-    Serial0.println("Scan each sticker, then type: name=YOUR_NAME");
-    Serial0.println("Type 'd' when done, 'list' to see roster, 'clear' to reset.");
+    LOG.println("No students enrolled. Starting setup...");
+    LOG.println("Scan each sticker, then type: name=YOUR_NAME");
+    LOG.println("Type 'd' when done, 'list' to see roster, 'clear' to reset.");
     enterMode(MODE_SETUP);
     printSerialHelp();
     bootShowStatus();
@@ -1536,7 +1672,7 @@ void bootShowStatus() {
   showStatusView();
   if (nfcReady && sdReady) statusViewUntil = millis() + 4000;
   else statusViewUntil = 0;
-  Serial0.println("(屏幕上是状态页，串口敲 t 随时再看；h 看命令列表)");
+  LOG.println("(屏幕上是状态页，串口敲 t 随时再看；h 看命令列表)");
 }
 
 void loop(void) {
@@ -1547,17 +1683,32 @@ void loop(void) {
     enterMode(sysMode);
   }
   ledTick();
+  LOG.pump();          // USB CDC 枚举好了就把缓存的启动日志补发出去
+
+  // 心跳：每 5 秒打一行，串口到底通不通一眼就能看出来。
+  // 屏幕右下角的小方块也同步翻色，用来确认主循环还在跑。
+  {
+    static uint32_t lastBeat = 0;
+    if (millis() - lastBeat >= 5000) {
+      lastBeat = millis();
+      beatToggle = !beatToggle;
+      fillRect(231, 229, 8, 8, beatToggle ? GREEN : BLACK);
+      LOG.printf("[alive] t=%lus heap=%luKB mode=%s sd=%s nfc=%s students=%d\n",
+                 millis() / 1000, ESP.getFreeHeap() / 1024, modeName(),
+                 sdReady ? "OK" : "FAIL", nfcReady ? "OK" : "FAIL", studentCount);
+    }
+  }
 
   // 长按 A 只在刷卡 / 未交名单 / 开新作业 这三个界面生效。
   // 登记模式和写卡模式下必须忽略，否则登记学生时长按会直接清空整份名单。
   if (btnNextLongPress) {
     btnNextLongPress = false;
     if (sysMode == MODE_CHECKIN || sysMode == MODE_MISSING || sysMode == MODE_CONFIRM_NEW) {
-      Serial0.println("Long press detected - reset all");
+      LOG.println("Long press detected - reset all");
       resetAll();
       enterMode(MODE_CHECKIN);
     } else {
-      Serial0.println("Long press ignored (not in checkin view)");
+      LOG.println("Long press ignored (not in checkin view)");
     }
   }
 
@@ -1567,12 +1718,12 @@ void loop(void) {
   }
 
   if (sysMode == MODE_WRITE) {
-    while (Serial0.available()) {
-      char c = Serial0.read();
+    while (LOG.available()) {
+      char c = LOG.read();
       if (c == 'r' || c == 'R') {
         writeMode = false;
         enterMode(MODE_CHECKIN);
-        Serial0.println("-> CHECKIN MODE");
+        LOG.println("-> CHECKIN MODE");
       }
     }
     if (!nfcReady) return;
@@ -1585,13 +1736,13 @@ void loop(void) {
       if (!changed) for (uint8_t i = 0; i < uidLength; i++)
         if (uid[i] != writeLastUID[i]) { changed = true; break; }
       if (changed) {
-        Serial0.print("Write UID: ");
+        LOG.print("Write UID: ");
         for (uint8_t i = 0; i < uidLength; i++) {
-          if (uid[i] < 0x10) Serial0.print("0");
-          Serial0.print(uid[i], HEX);
-          Serial0.print(" ");
+          if (uid[i] < 0x10) LOG.print("0");
+          LOG.print(uid[i], HEX);
+          LOG.print(" ");
         }
-        Serial0.println();
+        LOG.println();
 
         // 已经登记过的卡 -> 把它的编号重写回去（补写/修卡）
         // 没登记过的卡 -> 分配一个新编号
@@ -1601,19 +1752,19 @@ void loop(void) {
         if (known >= 0) {
           sid = roster[known].sid;
           kind = 1;
-          Serial0.printf("Known card #%d, re-write sid=%u\n", known + 1, sid);
+          LOG.printf("Known card #%d, re-write sid=%u\n", known + 1, sid);
         } else {
           sid = nextFreeSid();
           kind = 0;
-          Serial0.printf("New card, assign sid=%u\n", sid);
+          LOG.printf("New card, assign sid=%u\n", sid);
         }
 
         if (sid == 0) {
-          Serial0.println("No free SID left!");
+          LOG.println("No free SID left!");
           showWriteDone(2, 0, uid, uidLength);
         } else if (writeCardSid(sid)) {
           showWriteDone(kind, sid, uid, uidLength);
-          Serial0.println("WRITE OK");
+          LOG.println("WRITE OK");
           // 只有真发了新编号才推进待分配号
           if (kind == 0) {
             writePendingSid = nextFreeSid();
@@ -1622,7 +1773,7 @@ void loop(void) {
           }
         } else {
           showWriteDone(2, sid, uid, uidLength);
-          Serial0.println("WRITE FAIL");
+          LOG.println("WRITE FAIL");
         }
 
         memcpy(writeLastUID, uid, uidLength);
@@ -1638,7 +1789,7 @@ void loop(void) {
     if (btnNextFlag) {
       btnNextFlag = false;
       nextHomework();
-      Serial0.printf("Started HW %d\n", currentHW + 1);
+      LOG.printf("Started HW %d\n", currentHW + 1);
       enterMode(MODE_CHECKIN);
     }
     if (btnUpFlag || btnDownFlag) {
@@ -1649,23 +1800,23 @@ void loop(void) {
   }
 
   // 串口命令：n/u/m 等价于按键 A/B/C，没有按键时靠这些操作
-  while (Serial0.available()) {
-    String cmd = Serial0.readStringUntil('\n');
+  while (LOG.available()) {
+    String cmd = LOG.readStringUntil('\n');
     cmd.trim();
     if (cmd.length() == 0) continue;
     char c = cmd[0];
 
-    if (c == 'n' || c == 'N') { btnNextFlag = true; Serial0.println("[A] next / confirm"); }
-    else if (c == 'u' || c == 'U') { btnUpFlag = true; Serial0.println("[B] up / cancel"); }
-    else if (c == 'm' || c == 'M') { btnDownFlag = true; Serial0.println("[C] missing / down"); }
-    else if (c == 's' || c == 'S') { enterMode(MODE_SETUP); Serial0.println("-> SETUP MODE"); }
+    if (c == 'n' || c == 'N') { btnNextFlag = true; LOG.println("[A] next / confirm"); }
+    else if (c == 'u' || c == 'U') { btnUpFlag = true; LOG.println("[B] up / cancel"); }
+    else if (c == 'm' || c == 'M') { btnDownFlag = true; LOG.println("[C] missing / down"); }
+    else if (c == 's' || c == 'S') { enterMode(MODE_SETUP); LOG.println("-> SETUP MODE"); }
     else if (c == 'w' || c == 'W') {
-      if (!nfcReady) { Serial0.println("Write mode needs PN532, not connected"); }
-      else { writeMode = true; writeLastLen = 0; enterMode(MODE_WRITE); Serial0.println("-> WRITE MODE"); }
+      if (!nfcReady) { LOG.println("Write mode needs PN532, not connected"); }
+      else { writeMode = true; writeLastLen = 0; enterMode(MODE_WRITE); LOG.println("-> WRITE MODE"); }
     }
-    else if (c == 'r' || c == 'R') { enterMode(MODE_CHECKIN); Serial0.println("-> CHECKIN MODE"); }
+    else if (c == 'r' || c == 'R') { enterMode(MODE_CHECKIN); LOG.println("-> CHECKIN MODE"); }
     else if (c == 'l' || c == 'L') {
-      if (!sdReady) { Serial0.println("ls: SD 卡没挂上"); }
+      if (!sdReady) { LOG.println("ls: SD 卡没挂上"); }
       else listSdFiles("---- SD 卡根目录 ----");
     }
     else if (c == 't' || c == 'T') {
@@ -1673,19 +1824,19 @@ void loop(void) {
         statusViewActive = false;
         statusViewUntil = 0;
         enterMode(sysMode);
-        Serial0.println("-> 状态页已关闭");
+        LOG.println("-> 状态页已关闭");
       } else {
         showStatusView();
         statusViewUntil = 0;      // 手动打开就一直停着
-        Serial0.println("-> 状态页（再敲 t 关闭）");
+        LOG.println("-> 状态页（再敲 t 关闭）");
       }
       printStatus();
     }
     else if (cmd.startsWith("sim=")) {
       String arg = cmd.substring(4);
       arg.trim();
-      if (arg.length() == 0) { Serial0.println("用法: sim=<姓名> 或 sim=<UID十六进制> 或 sim?"); continue; }
-      if (arg == "?") { showCheckInResult(-1, nullptr, 0); Serial0.println("sim: unknown card"); continue; }
+      if (arg.length() == 0) { LOG.println("用法: sim=<姓名> 或 sim=<UID十六进制> 或 sim?"); continue; }
+      if (arg == "?") { showCheckInResult(-1, nullptr, 0); LOG.println("sim: unknown card"); continue; }
 
       // 先按姓名找，找不到再按 UID 十六进制找
       int idx = -1;
@@ -1693,7 +1844,7 @@ void loop(void) {
         if (strcmp(roster[i].name, arg.c_str()) == 0) { idx = i; break; }
       }
       if (idx >= 0) {
-        Serial0.printf("sim: %s\n", roster[idx].name);
+        LOG.printf("sim: %s\n", roster[idx].name);
         showCheckInResult(idx, roster[idx].uid, roster[idx].uidLen);
       } else {
         uint8_t uid[7] = {0};
@@ -1707,9 +1858,9 @@ void loop(void) {
           } else tok += ch;
         }
         if (tok.length() == 2 && len < 7) uid[len++] = (uint8_t)strtol(tok.c_str(), NULL, 16);
-        if (len == 0) { Serial0.println("sim: 找不到这个学生"); continue; }
+        if (len == 0) { LOG.println("sim: 找不到这个学生"); continue; }
         idx = findStudent(uid, len);
-        Serial0.printf("sim: UID -> %s\n", idx >= 0 ? roster[idx].name : "UNKNOWN");
+        LOG.printf("sim: UID -> %s\n", idx >= 0 ? roster[idx].name : "UNKNOWN");
         showCheckInResult(idx, uid, len);
       }
       delay(1500);
@@ -1719,10 +1870,10 @@ void loop(void) {
       // 读卡器自检：只走读卡链路，不碰名单、不写卡，
       // 用来确认接线和拨码开关对不对。
       if (!nfcReady) {
-        Serial0.println("probe: PN532 没连上，先查接线和拨码开关");
+        LOG.println("probe: PN532 没连上，先查接线和拨码开关");
         continue;
       }
-      Serial0.println("probe: 连续扫描 10 秒，把卡片放上去...");
+      LOG.println("probe: 连续扫描 10 秒，把卡片放上去...");
       unsigned long t0 = isrMillis();
       uint8_t lastUID[7] = {0};
       uint8_t lastLen = 0;
@@ -1735,21 +1886,21 @@ void loop(void) {
           if (same) for (uint8_t i = 0; i < len; i++)
             if (uid[i] != lastUID[i]) { same = false; break; }
           if (!same) {
-            Serial0.printf("  卡 #%d UID:", ++seen);
-            for (uint8_t i = 0; i < len; i++) Serial0.printf(" %02X", uid[i]);
-            Serial0.printf("  (%d 字节)", len);
+            LOG.printf("  卡 #%d UID:", ++seen);
+            for (uint8_t i = 0; i < len; i++) LOG.printf(" %02X", uid[i]);
+            LOG.printf("  (%d 字节)", len);
 
             uint16_t sid = 0;
             if (readCardSid(&sid)) {
               int owner = findStudentBySid(sid);
-              Serial0.printf("  编号=%04u", sid);
-              if (owner >= 0) Serial0.printf("  属于 %s", roster[owner].name);
-              else Serial0.print("  名单里没人");
+              LOG.printf("  编号=%04u", sid);
+              if (owner >= 0) LOG.printf("  属于 %s", roster[owner].name);
+              else LOG.print("  名单里没人");
             } else {
-              Serial0.print("  卡内无编号（空白卡 / 非本系统）");
+              LOG.print("  卡内无编号（空白卡 / 非本系统）");
             }
             int known = findStudent(uid, len);
-            Serial0.printf("  名单:%s\n", known >= 0 ? roster[known].name : "未登记");
+            LOG.printf("  名单:%s\n", known >= 0 ? roster[known].name : "未登记");
             memcpy(lastUID, uid, len);
             lastLen = len;
           }
@@ -1759,16 +1910,16 @@ void loop(void) {
           delay(100);
         }
       }
-      Serial0.printf("probe 结束，共识别 %d 张卡\n", seen);
+      LOG.printf("probe 结束，共识别 %d 张卡\n", seen);
       if (seen == 0) {
-        Serial0.println("一张都没读到，依次检查：");
-        Serial0.println("  1. 拨码开关是不是 SPI 模式");
-        Serial0.println("  2. SCK/MISO/MOSI/SS 四根线有没有接错或松动");
-        Serial0.println("  3. 卡片是不是 ISO14443A（NTAG/Mifare）—— 身份证和门禁卡不行");
+        LOG.println("一张都没读到，依次检查：");
+        LOG.println("  1. 拨码开关是不是 SPI 模式");
+        LOG.println("  2. SCK/MISO/MOSI/SS 四根线有没有接错或松动");
+        LOG.println("  3. 卡片是不是 ISO14443A（NTAG/Mifare）—— 身份证和门禁卡不行");
       }
     }
     else if (c == 'h' || c == 'H') printSerialHelp();
-    else Serial0.println("未知命令，输入 h 看帮助");
+    else LOG.println("未知命令，输入 h 看帮助");
   }
 
   if (btnNextFlag) {
@@ -1777,7 +1928,7 @@ void loop(void) {
     if (submitted == studentCount && studentCount > 0) {
       if (currentHW + 1 < MAX_HOMEWORK) {
         nextHomework();
-        Serial0.printf("Auto-advanced to HW %d (all submitted)\n", currentHW + 1);
+        LOG.printf("Auto-advanced to HW %d (all submitted)\n", currentHW + 1);
         showAllDone();
         delay(1500);
         enterMode(MODE_CHECKIN);
@@ -1825,10 +1976,10 @@ void loop(void) {
 
     if (changed) {
       int idx = findStudent(uid, uidLength);
-      Serial0.printf("UID: ");
-      for (uint8_t i = 0; i < uidLength; i++) Serial0.printf("%02X ", uid[i]);
-      if (idx >= 0) Serial0.printf("-> %s", roster[idx].name);
-      else Serial0.print("-> UNKNOWN");
+      LOG.printf("UID: ");
+      for (uint8_t i = 0; i < uidLength; i++) LOG.printf("%02X ", uid[i]);
+      if (idx >= 0) LOG.printf("-> %s", roster[idx].name);
+      else LOG.print("-> UNKNOWN");
 
       // 核对卡内编号：UID 对上名单还不够，卡里存的编号也得一致。
       // 不一致说明这张卡是别人的（张冠李戴）或被改写过，必须拦下来。
@@ -1836,11 +1987,11 @@ void loop(void) {
         uint16_t cardSid = 0;
         if (readCardSid(&cardSid)) {
           if (cardSid == roster[idx].sid) {
-            Serial0.printf("  [sid %04u OK]", cardSid);
+            LOG.printf("  [sid %04u OK]", cardSid);
           } else {
-            Serial0.printf("  [SID MISMATCH! card=%u roster=%u]",
+            LOG.printf("  [SID MISMATCH! card=%u roster=%u]",
                            cardSid, roster[idx].sid);
-            Serial0.println("  !! 卡里编号和名单对不上，疑似拿错卡/换卡");
+            LOG.println("  !! 卡里编号和名单对不上，疑似拿错卡/换卡");
             showSidMismatch(idx, cardSid, uid, uidLength);
             memcpy(lastUID, uid, uidLength);
             lastLen = uidLength;
@@ -1849,7 +2000,7 @@ void loop(void) {
             return;
           }
         } else {
-          Serial0.println("  [card has no valid sid - was it written?]");
+          LOG.println("  [card has no valid sid - was it written?]");
           showSidMismatch(idx, 0, uid, uidLength);
           memcpy(lastUID, uid, uidLength);
           lastLen = uidLength;
@@ -1858,7 +2009,7 @@ void loop(void) {
           return;
         }
       }
-      Serial0.println();
+      LOG.println();
 
       showCheckInResult(idx, uid, uidLength);
       memcpy(lastUID, uid, uidLength);
@@ -1870,7 +2021,7 @@ void loop(void) {
         showAllDone();
         delay(1500);
         nextHomework();
-        Serial0.printf("Auto HW %d started\n", currentHW + 1);
+        LOG.printf("Auto HW %d started\n", currentHW + 1);
       }
       enterMode(MODE_CHECKIN);
     }

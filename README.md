@@ -75,6 +75,61 @@ Arduino IDE 库管理器里装：
 
 ---
 
+## 串口连不上 / 没反应怎么查
+
+本机接线：**USB-TTL 桥（CH340）接 UART0**，即 GPIO44(收) / GPIO43(发)。
+`Serial0` 就是 UART0；`Serial`（USB CDC）在这块板子上用不了，固件默认也不走它。
+
+### 1. 先看端口对不对
+
+设备管理器 / 终端里查：
+
+```
+USB-SERIAL CH340 (COM3)    <- 实际是这个
+```
+
+> `参数.xlsx` 里写的 COM4 是旧值，**别照着选**。
+> Arduino IDE 右下角或「工具 → 端口」里选实际枚举出来的那个。
+
+### 2. 波特率 115200
+
+UART0 是真串口，波特率必须对。串口监视器右下角设置成 **115200**。
+
+### 3. 烧录完按一下 RESET
+
+固件只在开机时打一次 banner。中途打开监视器看不到是正常的——
+所以固件加了**每 5 秒一次的心跳**：
+
+```
+[alive] t=5s heap=186KB mode=刷卡登记 sd=OK nfc=OK students=0
+[alive] t=10s heap=186KB mode=刷卡登记 sd=OK nfc=OK students=0
+```
+
+看到这行 = 串口通。看不到 = 端口/波特率/接线有一处不对。
+
+### 4. 还是没反应？按这个顺序排
+
+| 现象 | 原因 | 怎么办 |
+|------|------|--------|
+| 监视器一片空白，但屏幕正常显示 | 端口选错 / 波特率不对 | 回到第 1、2 步 |
+| 有心跳但敲命令没反应 | 串口监视器行尾设成了 `No line ending` | 改成 `Both NL & CR`；固件已做超时兜底，但仍建议改 |
+| 烧录时提示找不到端口 | CH340 驱动没装 | 装 CH340 驱动 |
+| 板子上电完全没反应（屏幕也不亮） | 固件没跑起来 | 看屏幕右下角有没有绿点闪烁（心跳），有就说明程序活着 |
+
+### 5. 桥接芯片不在默认引脚上？
+
+UART0 默认是 GPIO44(收)/GPIO43(发)。如果你那块板的 USB-TTL 桥接到了别的引脚，
+改 `sketch_sep6a.ino` 顶部这两行（RX 在前、TX 在后）：
+
+```cpp
+#define UART0_RX_PIN -1
+#define UART0_TX_PIN -1
+```
+
+比如桥接在 GPIO11/12：`#define UART0_RX_PIN 11` / `#define UART0_TX_PIN 12`。
+
+---
+
 ## 编译烧录
 
 1. Arduino IDE 开发板选 **ESP32S3 Dev Module**（参照根目录 `参数.xlsx` 的完整配置：16MB Flash、QIO 80MHz、USB CDC On Boot 启用等）
