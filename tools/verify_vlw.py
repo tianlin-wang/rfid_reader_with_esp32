@@ -43,10 +43,18 @@ class VLW:
         for i in range(self.gCount):
             off = 24 + i * 28
             f = struct.unpack(">7I", self.data[off:off + 28])
-            unicode, height, width, xa, dy, dx = f[0], f[1], f[2], f[3], f[4], f[5]
-            w8, xadv8 = width & 0xFF, xa & 0xFF
-            dX = dx if dx < 128 else dx - 256
-            dY = dy if dy < 32768 else dy - 65536
+            # 与 LovyanGFX 的读法严格一致：
+            #   unicode = (uint16_t)getSwap32(buf[0])
+            #   height  = getSwap32(buf[1])
+            #   width   = (uint8_t)getSwap32(buf[2])
+            #   xa      = (uint8_t)getSwap32(buf[3])
+            #   dY      = (int16_t)getSwap32(buf[4])  -> 第 18~19 字节
+            #   dX      = (int8_t)getSwap32(buf[5])   -> 第 23 字节
+            unicode = f[0] & 0xFFFF
+            height = f[1]
+            w8, xadv8 = f[2] & 0xFF, f[3] & 0xFF
+            dY = struct.unpack_from(">h", self.data, off + 18)[0]
+            dX = struct.unpack_from(">b", self.data, off + 23)[0]
 
             if (unicode > 0xFF) or (0x20 < unicode < 0xA0 and unicode != 0x7F):
                 if self.maxAscent < dY and unicode != 0x3000:

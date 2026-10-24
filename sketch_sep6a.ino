@@ -46,6 +46,9 @@ bool nfcReady = false;
 // PN532 固件版本（setup 时读到）。0 = 没读到。
 uint32_t nfcFwVer = 0;
 
+// 实际加载的 VLW 文件名（状态页要显示）
+char fontName[48] = "";
+
 // ============ 状态页（顶替不存在的指示灯） ============
 // 板子上没有 LED 时，"系统现在跑到哪一步了"只能靠屏幕和串口来判断。
 // 开机先弹这个状态页，串口敲 t 随时可以再调出来。
@@ -574,9 +577,45 @@ void st7789Init() {
   lcd.setFont(&fonts::Font0);
 }
 
+// 列出 SD 卡根目录的文件（判断"卡上到底有什么"时很有用）
+void listSdFiles(const char *tag) {
+  Serial0.printf("%s\n", tag);
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) {
+    Serial0.println("  (打不开根目录)");
+    if (root) root.close();
+    return;
+  }
+  int n = 0;
+  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+    Serial0.printf("  %-24s %8lu B%s\n", f.name(), (unsigned long)f.size(),
+                   f.isDirectory() ? "  [目录]" : "");
+    n++;
+    f.close();
+  }
+  root.close();
+  if (n == 0) Serial0.println("  (空)");
+}
+
+// 判断一个文件是不是 VLW（不是的话多半是 .ttf 改名来的）
+bool looksLikeVlw(const char *path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  uint8_t h[4] = {0, 0, 0, 0};
+  f.read(h, 4);
+  f.close();
+  if (h[0] == 0x00 && h[1] == 0x01) return false;                 // TTF (sfnt)
+  if (h[0] == 'O' && h[1] == 'T' && h[2] == 'T' && h[3] == 'O') return false;  // OTF
+  if (h[0] == 't' && h[1] == 'r' && h[2] == 'u' && h[3] == 'e') return false;  // TrueType
+  if (h[0] == 'w' && h[1] == 'O' && h[2] == 'F' && h[3] == 'F') return false;  // WOFF
+  if (h[0] == 'w' && h[1] == 'O' && h[2] == 'F' && h[3] == '2') return false;  // WOFF2
+  return true;
+}
+
 // 必须在 initSD() 之后调用：SD 卡上有没有字库到这时才知道
 void initFont() {
   useTTF = false;
+  fontName[0] = 0;
 
   if (!sdReady) {
     Serial0.println("Font: no SD card, fall back to built-in 16x16 bitmap");
@@ -585,25 +624,60 @@ void initFont() {
 
   // 只认 vlw。loadFont() 没装 TTF 解码器时会把一切当 VLW 解析，
   // 别放 .ttf/.otf 进卡，会乱码。
-  const char *cands[] = { "/font.vlw", nullptr };
-  for (int i = 0; cands[i]; i++) {
-    if (!SD.exists(cands[i])) continue;
-    Serial0.printf("Font: try %s...\n", cands[i]);
-    if (lcd.loadFont(SD, cands[i])) {
-      // setTextSize 是"倍率"不是像素！VLW 自带行高，按行高等比缩放到 FONT_SIZE，
-      // 这样就算以后重新生成了别的字号的 vlw，UI 的 16px 行距也不会乱。
-      float h = (float)lcd.fontHeight();
-      if (h > 1.0f) lcd.setTextSize((float)FONT_SIZE / h);
-      useTTF = true;
-      Serial0.printf("Font: vlw loaded (%s), native line height=%.0f, scale=%.2f\n",
-                     cands[i], h, (h > 1.0f) ? (float)FONT_SIZE / h : 1.0f);
-      return;
+  // 优先 /font.vlw；没有就扫根目录，把第一个 .vlw 拿来用（文件名不用改）。
+  char path[48] = "";
+  if (SD.exists("/font.vlw")) {
+    strcpy(path, "/font.vlw");
+  } else {
+    File root = SD.open("/");
+    if (root && root.isDirectory()) {
+      for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+        if (!f.isDirectory()) {
+          const char *n = f.name();
+          size_t len = strlen(n);
+          if (len > 4 && len < 40) {
+            bool isV = (n[len-4] == '.') &&
+                       (n[len-3] == 'v' || n[len-3] == 'V') &&
+                       (n[len-2] == 'l' || n[len-2] == 'L') &&
+                       (n[len-1] == 'w' || n[len-1] == 'W');
+            if (isV) { snprintf(path, sizeof(path), "/%s", n); f.close(); break; }
+          }
+        }
+        f.close();
+      }
+      root.close();
     }
-    Serial0.println("Font: load failed");
   }
 
-  Serial0.printf("Font: no font.vlw on card, using built-in bitmap (%d ASCII + %d CJK)\n",
-                 FONT_CN_ASCII_COUNT, FONT_CN_CJK_COUNT);
+  if (path[0] == 0) {
+    Serial0.println("Font: no .vlw on card, using built-in bitmap");
+    listSdFiles("Font: 卡上现在的文件:");
+    Serial0.printf("Font: built-in bitmap (%d ASCII + %d CJK)\n",
+                   FONT_CN_ASCII_COUNT, FONT_CN_CJK_COUNT);
+    return;
+  }
+
+  Serial0.printf("Font: try %s...\n", path);
+  if (!looksLikeVlw(path)) {
+    Serial0.println("Font: 这个文件不是 VLW 格式（可能是 .ttf 改了后缀）");
+    Serial0.println("Font: 请用 tools/gen_font_cn.py 生成真正的 font.vlw");
+    listSdFiles("Font: 卡上现在的文件:");
+    return;
+  }
+
+  if (lcd.loadFont(SD, path)) {
+    // setTextSize 是"倍率"不是像素！VLW 自带行高，按行高等比缩放到 FONT_SIZE，
+    // 这样就算以后重新生成了别的字号的 vlw，UI 的 16px 行距也不会乱。
+    float h = (float)lcd.fontHeight();
+    if (h > 1.0f) lcd.setTextSize((float)FONT_SIZE / h);
+    useTTF = true;
+    snprintf(fontName, sizeof(fontName), "%s", path);
+    Serial0.printf("Font: vlw loaded (%s), native line height=%.0f, scale=%.2f\n",
+                   path, h, (h > 1.0f) ? (float)FONT_SIZE / h : 1.0f);
+    return;
+  }
+  Serial0.println("Font: load failed (文件损坏或字形表为空?)");
+  listSdFiles("Font: 卡上现在的文件:");
 }
 
 void fillColor(uint16_t c) { lcd.fillScreen(c); }
@@ -745,7 +819,10 @@ void showStatusView() {
   }
 
   if (useTTF) {
-    statusRow(104, "字库", "vlw (卡上)", GREEN);
+    // 文件名可能很长，截断一下免得撑破 240 宽
+    char fn[24];
+    snprintf(fn, sizeof(fn), "%s", fontName);
+    statusRow(104, "字库", fn, GREEN);
   } else {
     statusRow(104, "字库", "内置点阵", YELLOW);
   }
@@ -774,7 +851,8 @@ void printStatus() {
     Serial0.println("  读卡器    : 未找到 —— 检查接线 + 拨码开关(SPI 模式) + 断电重上电");
   }
   Serial0.printf("  SD 卡     : %s\n", sdReady ? "OK" : "挂载失败 —— 检查接线/卡是否插好/是不是 FAT32");
-  Serial0.printf("  字库      : %s\n", useTTF ? "vlw（卡上 /font.vlw）" : "内置 16x16 点阵（卡上没有 font.vlw）");
+  if (useTTF) Serial0.printf("  字库      : %s（卡上）\n", fontName);
+  else Serial0.println("  字库      : 内置 16x16 点阵（卡上没有 .vlw）");
   Serial0.printf("  学生      : %d 人\n", studentCount);
   Serial0.printf("  当前作业  : 第 %d 次，已交 %d/%d\n",
                  currentHW + 1, getSubmittedCount(currentHW), studentCount);
@@ -1232,6 +1310,7 @@ void printSerialHelp() {
   Serial0.println("  r    = 回到刷卡界面");
   Serial0.println("  list = 查看名单（含编号）");
   Serial0.println("  t    = 状态页：屏幕+串口看各模块运行状况（没有指示灯就看这个）");
+  Serial0.println("  ls   = 列出 SD 卡根目录的文件");
   Serial0.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
   Serial0.println("  sim=<姓名>   模拟刷某人的卡");
   Serial0.println("  sim=<UID>    模拟刷指定 UID");
@@ -1296,6 +1375,10 @@ void handleSerialSetup() {
       showStatusView();
       statusViewUntil = 0;
       printStatus();
+    }
+    if (strcmp(line, "ls") == 0 || strcmp(line, "LS") == 0) {
+      if (!sdReady) Serial0.println("ls: SD 卡没挂上");
+      else listSdFiles("---- SD 卡根目录 ----");
     }
     if (strncmp(line, "name=", 5) == 0) {
       if (!waitingForName) {
@@ -1581,6 +1664,10 @@ void loop(void) {
       else { writeMode = true; writeLastLen = 0; enterMode(MODE_WRITE); Serial0.println("-> WRITE MODE"); }
     }
     else if (c == 'r' || c == 'R') { enterMode(MODE_CHECKIN); Serial0.println("-> CHECKIN MODE"); }
+    else if (c == 'l' || c == 'L') {
+      if (!sdReady) { Serial0.println("ls: SD 卡没挂上"); }
+      else listSdFiles("---- SD 卡根目录 ----");
+    }
     else if (c == 't' || c == 'T') {
       if (statusViewActive) {
         statusViewActive = false;
