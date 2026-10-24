@@ -43,6 +43,20 @@ bool sdReady = false;
 // 名单、作业状态、屏幕、SD 存档都能先用串口验证。
 bool nfcReady = false;
 
+// PN532 固件版本（setup 时读到）。0 = 没读到。
+uint32_t nfcFwVer = 0;
+
+// ============ 状态页（顶替不存在的指示灯） ============
+// 板子上没有 LED 时，"系统现在跑到哪一步了"只能靠屏幕和串口来判断。
+// 开机先弹这个状态页，串口敲 t 随时可以再调出来。
+bool statusViewActive = false;
+uint32_t statusViewUntil = 0;   // 0 = 一直停着，直到再按一次 t 切回
+
+// 可选状态灯：接一颗 LED（串 220~330Ω 电阻）到任意一个空闲 GPIO 和 GND 之间，
+// 然后把下面的数字改成那个 GPIO 号即可。-1 = 关闭（默认）。
+// 常亮=正常；慢闪=读卡器没接上；快闪=SD 卡挂载失败；双闪=登记模式。
+#define LED_PIN -1
+
 // ============ 颜色 ============
 #define BLACK   0x0000
 #define WHITE   0xFFFF
@@ -125,6 +139,12 @@ void saveRoster();
 uint16_t nextFreeSid();
 bool writeCardSid(uint16_t sid);
 bool readCardSid(uint16_t *sid);
+
+// 状态页相关（定义在 UI 区，setup/loop 在更后面）
+void showStatusView();
+void printStatus();
+void bootShowStatus();
+void ledTick();
 
 bool initSD() {
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -687,6 +707,132 @@ void showCheckInView() {
   printCentered(208, "m 名单   h 帮助");
 }
 
+// ============ 状态页 ============
+// 一屏看清：屏幕 / 读卡器 / SD 卡 / 字库 / 名单 / 作业 各到哪一步了。
+void statusRow(int16_t y, const char *label, const char *value, uint16_t vc) {
+  setTextColor(GRAY);
+  setCursor(4, y);
+  printStr(label);
+  setTextColor(vc);
+  setCursor(58, y);
+  printStr(value);
+}
+
+void showStatusView() {
+  statusViewActive = true;
+  fillColor(BLACK);
+  setTextBackground(BLACK);
+  setTextColor(YELLOW);
+  printCentered(2, "系统状态");
+  drawFastHLine(0, 20, 240, CYAN);
+
+  char buf[32];
+
+  statusRow(26, "屏幕", "OK  ST7789", GREEN);
+
+  if (nfcReady) {
+    snprintf(buf, sizeof(buf), "OK  PN532 F/W %d.%d",
+             (nfcFwVer >> 16) & 0xFF, (nfcFwVer >> 8) & 0xFF);
+    statusRow(52, "读卡器", buf, GREEN);
+  } else {
+    statusRow(52, "读卡器", "未找到！", RED);
+  }
+
+  if (sdReady) {
+    statusRow(78, "SD卡", "OK", GREEN);
+  } else {
+    statusRow(78, "SD卡", "挂载失败！", RED);
+  }
+
+  if (useTTF) {
+    statusRow(104, "字库", "vlw (卡上)", GREEN);
+  } else {
+    statusRow(104, "字库", "内置点阵", YELLOW);
+  }
+
+  snprintf(buf, sizeof(buf), "%d 人", studentCount);
+  statusRow(130, "学生", buf, WHITE);
+
+  snprintf(buf, sizeof(buf), "第 %d 次", currentHW + 1);
+  statusRow(156, "作业", buf, WHITE);
+
+  snprintf(buf, sizeof(buf), "%d / %d", getSubmittedCount(currentHW), studentCount);
+  statusRow(182, "已交", buf, WHITE);
+
+  setTextColor(GRAY);
+  printCentered(210, "t 返回  h 帮助");
+}
+
+// 串口版状态报告，比屏幕上更详细
+void printStatus() {
+  Serial0.println("---- 系统状态 ----");
+  Serial0.printf("  屏幕      : OK  ST7789 240x240\n");
+  if (nfcReady) {
+    Serial0.printf("  读卡器    : OK  PN532 F/W %d.%d\n",
+                   (nfcFwVer >> 16) & 0xFF, (nfcFwVer >> 8) & 0xFF);
+  } else {
+    Serial0.println("  读卡器    : 未找到 —— 检查接线 + 拨码开关(SPI 模式) + 断电重上电");
+  }
+  Serial0.printf("  SD 卡     : %s\n", sdReady ? "OK" : "挂载失败 —— 检查接线/卡是否插好/是不是 FAT32");
+  Serial0.printf("  字库      : %s\n", useTTF ? "vlw（卡上 /font.vlw）" : "内置 16x16 点阵（卡上没有 font.vlw）");
+  Serial0.printf("  学生      : %d 人\n", studentCount);
+  Serial0.printf("  当前作业  : 第 %d 次，已交 %d/%d\n",
+                 currentHW + 1, getSubmittedCount(currentHW), studentCount);
+  const char *m = "刷卡登记";
+  switch (sysMode) {
+    case MODE_CHECKIN:    m = "刷卡登记"; break;
+    case MODE_MISSING:    m = "未交名单"; break;
+    case MODE_SETUP:      m = "登记模式（刷卡 + name=姓名）"; break;
+    case MODE_WRITE:      m = "写卡模式（批量发编号）"; break;
+    case MODE_CONFIRM_NEW:m = "确认开新作业"; break;
+  }
+  Serial0.printf("  界面模式  : %s\n", m);
+  Serial0.printf("  运行      : 已启动 %lu 秒，空闲内存 %lu KB\n",
+                 millis() / 1000, ESP.getFreeHeap() / 1024);
+  Serial0.println("  提示      : t 状态页  h 帮助  probe 读卡器自检  list 名单");
+  Serial0.println("-------------------");
+}
+
+// 可选状态灯。LED_PIN 配成实际 GPIO 号才生效（-1 = 关闭）。
+// 常亮=一切正常；慢闪=读卡器没接上；快闪=SD 卡挂了；双闪=登记模式。
+void ledTick() {
+#if LED_PIN >= 0
+  static uint32_t t0 = 0;
+  static uint8_t  phase = 255;
+  uint32_t now = millis();
+  if (now - t0 < 60) return;
+
+  uint8_t want;
+  if (!nfcReady)      want = 1;   // 慢闪
+  else if (!sdReady)  want = 2;   // 快闪
+  else if (sysMode == MODE_SETUP || sysMode == MODE_WRITE) want = 3;  // 双闪
+  else                want = 0;   // 常亮
+
+  if (want == 0) {
+    if (phase != 0) { digitalWrite(LED_PIN, HIGH); phase = 0; }
+    t0 = now;
+    return;
+  }
+  if (want == 1) {            // 1 Hz
+    if ((now - t0) >= 500) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); t0 = now; }
+    return;
+  }
+  if (want == 2) {            // 5 Hz
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    t0 = now;
+    return;
+  }
+  // 双闪：亮 60ms 灭 120ms 亮 60ms 灭 720ms
+  if (phase == 255) { phase = 0; t0 = now; return; }
+  if (now - t0 >= 120) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    t0 = now;
+    phase++;
+    if (phase > 3) phase = 0;
+  }
+#endif
+}
+
 void showCheckInResult(int stuIdx, uint8_t *uid, uint8_t uidLen) {
   fillColor(BLACK);
   setTextBackground(BLACK);
@@ -1085,6 +1231,7 @@ void printSerialHelp() {
   Serial0.println("  w    = 进入写卡模式（批量发编号 / 补写卡）");
   Serial0.println("  r    = 回到刷卡界面");
   Serial0.println("  list = 查看名单（含编号）");
+  Serial0.println("  t    = 状态页：屏幕+串口看各模块运行状况（没有指示灯就看这个）");
   Serial0.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
   Serial0.println("  sim=<姓名>   模拟刷某人的卡");
   Serial0.println("  sim=<UID>    模拟刷指定 UID");
@@ -1094,6 +1241,9 @@ void printSerialHelp() {
 
 void enterMode(SystemMode m) {
   sysMode = m;
+  // 切界面时把状态页收掉，免得状态页和业务界面互相盖
+  statusViewActive = false;
+  statusViewUntil = 0;
   switch (m) {
     case MODE_CHECKIN: showCheckInView(); break;
     case MODE_MISSING: showMissingView(); break;
@@ -1141,6 +1291,11 @@ void handleSerialSetup() {
         }
         Serial0.println(")");
       }
+    }
+    if (strcmp(line, "t") == 0 || strcmp(line, "T") == 0) {
+      showStatusView();
+      statusViewUntil = 0;
+      printStatus();
     }
     if (strncmp(line, "name=", 5) == 0) {
       if (!waitingForName) {
@@ -1244,6 +1399,7 @@ void setup(void) {
     nfcReady = false;
   } else {
     Serial0.printf("PN5%d F/W %d.%d\n", (ver>>24)&0xFF, (ver>>16)&0xFF, (ver>>8)&0xFF);
+    nfcFwVer = ver;
     nfc.SAMConfig();
     nfcReady = true;
   }
@@ -1255,6 +1411,11 @@ void setup(void) {
   attachInterrupt(digitalPinToInterrupt(BTN_NEXT), isrNext, CHANGE);
   attachInterrupt(digitalPinToInterrupt(BTN_UP), isrUp, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_DOWN), isrDown, FALLING);
+
+#if LED_PIN >= 0
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+#endif
 
   Serial0.println("Init SD...");
   initSD();
@@ -1270,6 +1431,8 @@ void setup(void) {
     Serial0.println("Scan each sticker, then type: name=YOUR_NAME");
     Serial0.println("Type 'd' when done, 'list' to see roster, 'clear' to reset.");
     enterMode(MODE_SETUP);
+    printSerialHelp();
+    bootShowStatus();
     return;
   }
 
@@ -1281,9 +1444,27 @@ void setup(void) {
   }
 
   printSerialHelp();
+  bootShowStatus();
+}
+
+// 开机先弹状态页：全正常 4 秒后自动回主界面；有故障就停在状态页别动，
+// 让人一眼看出是哪一环挂了（板子上没指示灯，只能靠这个）。
+void bootShowStatus() {
+  showStatusView();
+  if (nfcReady && sdReady) statusViewUntil = millis() + 4000;
+  else statusViewUntil = 0;
+  Serial0.println("(屏幕上是状态页，串口敲 t 随时再看；h 看命令列表)");
 }
 
 void loop(void) {
+  // 状态页超时自动退回当前界面
+  if (statusViewActive && statusViewUntil != 0 && (int32_t)(millis() - statusViewUntil) >= 0) {
+    statusViewUntil = 0;
+    statusViewActive = false;
+    enterMode(sysMode);
+  }
+  ledTick();
+
   // 长按 A 只在刷卡 / 未交名单 / 开新作业 这三个界面生效。
   // 登记模式和写卡模式下必须忽略，否则登记学生时长按会直接清空整份名单。
   if (btnNextLongPress) {
@@ -1400,6 +1581,19 @@ void loop(void) {
       else { writeMode = true; writeLastLen = 0; enterMode(MODE_WRITE); Serial0.println("-> WRITE MODE"); }
     }
     else if (c == 'r' || c == 'R') { enterMode(MODE_CHECKIN); Serial0.println("-> CHECKIN MODE"); }
+    else if (c == 't' || c == 'T') {
+      if (statusViewActive) {
+        statusViewActive = false;
+        statusViewUntil = 0;
+        enterMode(sysMode);
+        Serial0.println("-> 状态页已关闭");
+      } else {
+        showStatusView();
+        statusViewUntil = 0;      // 手动打开就一直停着
+        Serial0.println("-> 状态页（再敲 t 关闭）");
+      }
+      printStatus();
+    }
     else if (cmd.startsWith("sim=")) {
       String arg = cmd.substring(4);
       arg.trim();
