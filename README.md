@@ -43,7 +43,7 @@
 
 > PN532 模块上的拨码开关要拨到 SPI 模式（SEL1=0，SEL2=1）。
 
-### SD 卡 —— SPI1_HOST
+### SD 卡 —— SPI（HSPI / 下标 1）
 
 | SD Pin | ESP32 Pin |
 |--------|-----------|
@@ -66,19 +66,38 @@
 
 > **★ SPI 主机分配（ESP32-S3，别改错）**
 >
-> | 设备 | SPI 主机 | IDF 编号 |
-> |------|---------|----------|
-> | 屏幕 ST7789 | `SPI2_HOST`（LovyanGFX 默认） | 1 |
-> | SD 卡 | `SPI1_HOST`（Arduino 里的 `FSPI`） | 0 |
+> Arduino 核心在 S2/S3 上只维护 2 条 SPI 总线，`_spi_bus_array[]` 的**下标**是：
 >
-> ESP32-S3 只有 3 个 SPI 控制器：`SPI0`（flash/PSRAM，占用）+ `SPI1` + `SPI2`，**没有 SPI3**。
-> Arduino 核心在 S3 上的宏是 `FSPI=0` / `HSPI=1`，其中 `HSPI` 就等于 IDF 的 `SPI2_HOST` ——
-> 所以 **SD 卡千万别写 `SPIClass sdSPI(HSPI)`**，会和屏幕抢同一条总线，
-> 两个库各自调 `spi_bus_initialize()`，第二次直接失败，**SD 卡 100% 挂不上**。
+> | 下标 | 寄存器 | 宏 | 谁在用 |
+> |------|--------|-----|--------|
+> | 0 | `SPI2_BASE` | `FSPI` | 屏幕 ST7789（LovyanGFX 内部映射到下标 0）|
+> | 1 | `SPI3_BASE` | `HSPI` | SD 卡 |
+>
+> **注意**：`FSPI`/`HSPI` 里的数字是**数组下标**，不是 IDF 的 `spi_host_device_t`。
+> 千万别写 `SPIClass sdSPI(SPI1_HOST)` —— `SPI1_HOST=0` 会落到下标 0（`SPI2_BASE`），
+> 正好和屏幕撞车，两个库各配一遍同一外设 → 屏幕/SD 全崩。
 >
 > ```cpp
-> SPIClass sdSPI(SPI1_HOST);   // ← 屏幕占 SPI2，SD 占 SPI1
+> SPIClass sdSPI(HSPI);   // ← SD 卡用下标 1
 > ```
+>
+> 补充：ESP32-S3 的 `SOC_SPI_PERIPH_NUM = 3`，IDF 里 `SPI1_HOST=0 / SPI2_HOST=1 / SPI3_HOST=2`，
+> 但 Arduino 的 `FSPI/HSPI` 宏映射到的是 **SPI2_BASE / SPI3_BASE**（跳过了 SPI1）。
+> 两套编号体系很容易混，改代码前先确认一下。
+
+### ⚠️ SD 卡：是板载卡槽还是外接模块？
+
+`ESP32S3 CAM LCD` 板子上**自带一个 microSD 卡槽**，它的引脚是焊死的。
+如果你把卡插在**板载卡槽**里，就必须用**板子的 SD 引脚**（不是下面表里自己接的那组）。
+`tools/inspect_vlw.py` 也支持直接扫盘符：`python tools/inspect_vlw.py E:`。
+
+挂载失败时按顺序查：
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 5 个频率全失败 | 卡是 **exFAT** | 格式化成 **FAT32**（单分区）|
+| 5 个频率全失败 | 接线/引脚不对 | 确认是板载卡槽还是外接模块，引脚别搞反 |
+| 5 个频率全失败 | 供电不足 | 带 AMS1117 稳压器的模块要 5V |
 
 ---
 

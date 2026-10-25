@@ -16,6 +16,12 @@
 #define BTN_UP    15
 #define BTN_DOWN  16
 
+// ---- SD 卡 ----
+// 现在这组是「外接 SD 模块」的自定接线。
+// 如果你把卡插在**板载卡槽**里，卡槽的引脚是焊死的，必须按板子丝印改下面 4 行。
+// ⚠️ 板载卡槽如果是 SPI 模式，通常在 GPIO 10/11/12/13 上 ——
+//    而这 4 个脚已经被 TFT_CS(10) / PN532_IRQ(11) / PN532_RST(12) / TFT_BLK(13) 占了，
+//    会打架。想用板载卡槽，得先把上面的 PN532/TFT 引脚挪开。
 #define SD_SCK    42
 #define SD_MISO   41
 #define SD_MOSI   40
@@ -169,19 +175,17 @@ DualConsole LOG;
 
 Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 
-// ★ ESP32-S3 上 SPI 主机的分配（这里踩过坑，务必别改错）
+// ★ ESP32-S3 上 SPI 的分配（这里踩过坑，务必别改错）
 //
-// IDF 编号:  SPI1_HOST=0  SPI2_HOST=1  SPI3_HOST=2
-// S3 实际只有 3 个 SPI 控制器: SPI0(flash/PSRAM，不能用) + SPI1 + SPI2
-// Arduino 核心在 S3 上的宏:  FSPI=0 (=SPI1_HOST)   HSPI=1 (=SPI2_HOST)
+// Arduino 核心在 S2/S3 上只维护 2 条 SPI 总线，`_spi_bus_array[]` 的**下标**是：
+//   [0] = DR_REG_SPI2_BASE   （宏 FSPI = 0）→ 屏幕在用（LovyanGFX 内部映射到下标 0）
+//   [1] = DR_REG_SPI3_BASE   （宏 HSPI = 1）→ SD 卡在用
 //
-// 屏幕用 LovyanGFX，默认 spi_host = SPI2_HOST (=1)
-// SD 卡原来写的是 SPIClass sdSPI(HSPI) —— HSPI 在 S3 上也是 1，
-// 于是屏幕和 SD 卡抢同一条总线，两个库各自调 spi_bus_initialize()，
-// 第二次直接失败 —— **SD 卡 100% 挂载失败**（现象就是"SD init FAILED"）。
-//
-// 正确分配：屏幕 = SPI2_HOST(1)，SD 卡 = SPI1_HOST(0) = Arduino 的 FSPI。
-SPIClass sdSPI(SPI1_HOST);
+// 注意：FSPI/HSPI 里的数字是**数组下标**，不是 IDF 的 spi_host_device_t！
+// 千万别写 `SPIClass sdSPI(SPI1_HOST)` —— SPI1_HOST=0 会落到下标 0（SPI2_BASE），
+// 正好和屏幕撞车，两个库各配一遍同一外设 → 屏幕/SD 全崩。
+// 就用 Arduino 的宏 HSPI 给 SD，FSPI 给屏幕。
+SPIClass sdSPI(HSPI);
 bool sdReady = false;
 
 // 读卡器没到货 / 没接时置 false：setup() 不再卡死，进入"无卡模式"，
@@ -323,7 +327,7 @@ bool initSD() {
   LOG.println("  1. 卡必须是 FAT32（Windows 格式化时选 FAT32，exFAT/NTFS 不认）");
   LOG.println("  2. 接线：SCK/MISO/MOSI/CS 四根 + VCC + GND，CS 别悬空");
   LOG.println("  3. 供电：带 AMS1110 稳压器的模块要 5V，只接 3.3V 会读不到卡");
-  LOG.println("  4. SPI 主机：屏幕占 SPI2_HOST，SD 必须占 SPI1_HOST（别改回去）");
+  LOG.println("  4. SPI：屏幕走 FSPI(下标0=SPI2_BASE)，SD 必须走 HSPI(下标1=SPI3_BASE)");
   return false;
 }
 
@@ -1643,7 +1647,7 @@ void handleSerialSetup() {
 
   uint8_t uid[7];
   uint8_t uidLength;
-  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50);
   if (ok) {
     static uint8_t lastUID[7] = {0};
     static uint8_t lastLen = 0;
@@ -1836,7 +1840,7 @@ void handleCommand(String cmd) {
     while (isrMillis() - t0 < 10000) {
       uint8_t uid[7];
       uint8_t len = 0;
-      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len)) {
+      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &len, 100)) {
         bool same = (len == lastLen);
         if (same) for (uint8_t i = 0; i < len; i++)
           if (uid[i] != lastUID[i]) { same = false; break; }
@@ -1940,7 +1944,7 @@ void loop(void) {
 
     uint8_t uid[7];
     uint8_t uidLength;
-    uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+    uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50);
     if (ok) {
       bool changed = (uidLength != writeLastLen);
       if (!changed) for (uint8_t i = 0; i < uidLength; i++)
@@ -2056,7 +2060,7 @@ void loop(void) {
 
   uint8_t uid[7];
   uint8_t uidLength;
-  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+  uint8_t ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50);
 
   static uint8_t lastUID[7] = {0};
   static uint8_t lastLen = 0;
