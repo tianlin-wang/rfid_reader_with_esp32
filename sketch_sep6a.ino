@@ -169,10 +169,19 @@ DualConsole LOG;
 
 Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 
-// 屏幕走 SPI2_HOST(FSPI)，SD 卡必须走 SPI3_HOST(HSPI)。
-// 两者都用同一个 SPI 主机时，LovyanGFX 和 Arduino SD 库会各自调用
-// spi_bus_initialize() 争抢同一条总线，SD 卡会挂载失败或屏幕花屏。
-SPIClass sdSPI(HSPI);
+// ★ ESP32-S3 上 SPI 主机的分配（这里踩过坑，务必别改错）
+//
+// IDF 编号:  SPI1_HOST=0  SPI2_HOST=1  SPI3_HOST=2
+// S3 实际只有 3 个 SPI 控制器: SPI0(flash/PSRAM，不能用) + SPI1 + SPI2
+// Arduino 核心在 S3 上的宏:  FSPI=0 (=SPI1_HOST)   HSPI=1 (=SPI2_HOST)
+//
+// 屏幕用 LovyanGFX，默认 spi_host = SPI2_HOST (=1)
+// SD 卡原来写的是 SPIClass sdSPI(HSPI) —— HSPI 在 S3 上也是 1，
+// 于是屏幕和 SD 卡抢同一条总线，两个库各自调 spi_bus_initialize()，
+// 第二次直接失败 —— **SD 卡 100% 挂载失败**（现象就是"SD init FAILED"）。
+//
+// 正确分配：屏幕 = SPI2_HOST(1)，SD 卡 = SPI1_HOST(0) = Arduino 的 FSPI。
+SPIClass sdSPI(SPI1_HOST);
 bool sdReady = false;
 
 // 读卡器没到货 / 没接时置 false：setup() 不再卡死，进入"无卡模式"，
@@ -291,12 +300,31 @@ void printStatus();
 void bootShowStatus();
 void ledTick();
 
+// 挂载 SD 卡。失败时逐个频率重试，并打印卡片信息。
+// 有些模块/卡对频率敏感（走线长、模块带稳压器降压），4MHz 不行 1MHz 行。
 bool initSD() {
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  sdReady = SD.begin(SD_CS, sdSPI, 4000000);
-  if (!sdReady) LOG.println("SD init FAILED (no card?)");
-  else LOG.println("SD card OK");
-  return sdReady;
+
+  const uint32_t freqs[] = {4000000, 10000000, 20000000, 40000000, 1000000};
+  for (int i = 0; i < (int)(sizeof(freqs) / sizeof(freqs[0])); i++) {
+    sdReady = SD.begin(SD_CS, sdSPI, freqs[i]);
+    LOG.printf("SD: 试 %lu Hz -> %s\n", (unsigned long)freqs[i], sdReady ? "OK" : "失败");
+    if (sdReady) {
+      LOG.printf("SD card OK  类型=%d  容量=%llu MB  已用=%llu KB\n",
+                 (int)SD.cardType(),
+                 (unsigned long long)(SD.cardSize() / 1048576ULL),
+                 (unsigned long long)(SD.usedBytes() / 1024ULL));
+      return true;
+    }
+    delay(60);
+  }
+
+  LOG.println("SD init FAILED —— 依次排查：");
+  LOG.println("  1. 卡必须是 FAT32（Windows 格式化时选 FAT32，exFAT/NTFS 不认）");
+  LOG.println("  2. 接线：SCK/MISO/MOSI/CS 四根 + VCC + GND，CS 别悬空");
+  LOG.println("  3. 供电：带 AMS1110 稳压器的模块要 5V，只接 3.3V 会读不到卡");
+  LOG.println("  4. SPI 主机：屏幕占 SPI2_HOST，SD 必须占 SPI1_HOST（别改回去）");
+  return false;
 }
 
 void uidToHex(uint8_t *uid, uint8_t len, char *buf) {

@@ -43,7 +43,7 @@
 
 > PN532 模块上的拨码开关要拨到 SPI 模式（SEL1=0，SEL2=1）。
 
-### SD 卡 —— SPI3 (HSPI)
+### SD 卡 —— SPI1_HOST
 
 | SD Pin | ESP32 Pin |
 |--------|-----------|
@@ -52,7 +52,7 @@
 | MOSI   | 40        |
 | CS     | 39        |
 
-> **注意**：屏幕和 SD 卡必须走不同的 SPI 主机。代码里屏幕用 `SPI2_HOST`、SD 卡用 `SPI3_HOST`，如果改成同一个主机会因为两边各自调用 `spi_bus_initialize()` 互相冲突。
+> **注意**：屏幕和 SD 卡必须走不同的 SPI 主机（详见下面那段）。改成同一个主机会因为两边各自调用 `spi_bus_initialize()` 互相冲突，**SD 卡直接挂不上**。
 
 ### 按键（另一端接 GND，内部上拉）
 
@@ -61,6 +61,24 @@
 | A    | 14        | 短按 = 开新作业 / 确认；**长按 1 秒 = 清空全部记录** |
 | B    | 15        | 上翻页 / 取消 |
 | C    | 16        | 切换到未交名单 / 下翻页 |
+
+---
+
+> **★ SPI 主机分配（ESP32-S3，别改错）**
+>
+> | 设备 | SPI 主机 | IDF 编号 |
+> |------|---------|----------|
+> | 屏幕 ST7789 | `SPI2_HOST`（LovyanGFX 默认） | 1 |
+> | SD 卡 | `SPI1_HOST`（Arduino 里的 `FSPI`） | 0 |
+>
+> ESP32-S3 只有 3 个 SPI 控制器：`SPI0`（flash/PSRAM，占用）+ `SPI1` + `SPI2`，**没有 SPI3**。
+> Arduino 核心在 S3 上的宏是 `FSPI=0` / `HSPI=1`，其中 `HSPI` 就等于 IDF 的 `SPI2_HOST` ——
+> 所以 **SD 卡千万别写 `SPIClass sdSPI(HSPI)`**，会和屏幕抢同一条总线，
+> 两个库各自调 `spi_bus_initialize()`，第二次直接失败，**SD 卡 100% 挂不上**。
+>
+> ```cpp
+> SPIClass sdSPI(SPI1_HOST);   // ← 屏幕占 SPI2，SD 占 SPI1
+> ```
 
 ---
 
