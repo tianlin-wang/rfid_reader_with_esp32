@@ -303,6 +303,106 @@ void showStatusView();
 void printStatus();
 void bootShowStatus();
 void ledTick();
+void sdLowLevelProbe();
+
+// 低层 SD 探测：绕过 SD 库，直接用 SPI 给卡片发 CMD0/CMD8/ACMD41。
+//   CMD0 无应答 -> 接线/供电问题（卡片压根没答话）
+//   CMD0 有应答 -> SPI 链路通，挂载失败就是文件系统格式问题（exFAT/NTFS 不认）
+uint8_t sdXfer(uint8_t b) { return sdSPI.transfer(b); }
+
+// 发一条 SD 命令，返回 R1。调用者自己读后续的 R3/R7 字节。
+// CS 释放前后都要补时钟，否则卡片状态机会卡住。
+uint8_t sdCmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
+  sdSPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+  digitalWrite(SD_CS, LOW);
+  sdXfer(0xFF);
+  sdXfer(0x40 | cmd);
+  sdXfer((uint8_t)(arg >> 24)); sdXfer((uint8_t)(arg >> 16));
+  sdXfer((uint8_t)(arg >> 8));  sdXfer((uint8_t)arg);
+  sdXfer(crc);
+  uint8_t r = 0xFF;
+  for (int i = 0; i < 32; i++) { r = sdXfer(0xFF); if (r != 0xFF) break; }
+  return r;                       // 注意：此处 CS 仍为低，供调用者继续读
+}
+void sdEndCmd(void) {
+  sdXfer(0xFF);
+  digitalWrite(SD_CS, HIGH);
+  for (int i = 0; i < 8; i++) sdXfer(0xFF);   // CS 释放后补 8 个时钟
+  sdSPI.endTransaction();
+}
+
+void sdLowLevelProbe() {
+  LOG.println("---- SD 低层探测（不走 SD 库，直接发命令）----");
+  LOG.printf("  引脚: SCK=%d MISO=%d MOSI=%d CS=%d\n", SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  for (int i = 0; i < 80; i++) sdXfer(0xFF);   // 上电：CS 高 + 74 个时钟
+
+  // 1) CMD0 复位
+  uint8_t r0 = sdCmd(0, 0, 0x95); sdEndCmd();
+  LOG.printf("  CMD0  (复位)      -> R1=0x%02X  %s\n", r0,
+             (r0 == 0x01) ? "OK 卡片应答" :
+             (r0 == 0xFF) ? "无应答 → 接线/供电问题" : "异常");
+  if (r0 == 0xFF) {
+    LOG.println("  结论：卡片在 SPI 上完全没应答。查：");
+    LOG.println("    - SCK/MISO/MOSI/CS 四根线有没有接错或松动（MISO 必须接对）");
+    LOG.println("    - VCC/GND 有没有接，GND 要和板子共地");
+    LOG.println("    - CS 是否悬空 / 接到别的脚上");
+    return;
+  }
+
+  // 2) CMD8 电压检查（SDHC/SDXC 必过）
+  uint8_t r8 = sdCmd(8, 0x1AA, 0x87);
+  uint8_t e0 = sdXfer(0xFF), e1 = sdXfer(0xFF), e2 = sdXfer(0xFF), e3 = sdXfer(0xFF);
+  sdEndCmd();
+  LOG.printf("  CMD8  (电压检查)  -> R1=0x%02X  回显=%02X%02X%02X%02X  %s\n",
+             r8, e0, e1, e2, e3,
+             (e2 == 0x01 && e3 == 0xAA) ? "OK SDHC/SDXC 卡" : "异常");
+
+  // 3) CMD58 读 OCR（看卡片接受哪个电压范围，很多卡要先做这步）
+  uint8_t r58 = sdCmd(58, 0, 0xFF);
+  uint8_t o0 = sdXfer(0xFF), o1 = sdXfer(0xFF), o2 = sdXfer(0xFF), o3 = sdXfer(0xFF);
+  sdEndCmd();
+  LOG.printf("  CMD58 (读 OCR)    -> R1=0x%02X  OCR=%02X%02X%02X%02X  电压位=%s\n",
+             r58, o0, o1, o2, o3,
+             (o1 & 0x20) ? "3.2~3.3V" : (o1 & 0x10) ? "3.0~3.1V" : "2.7~3.0V");
+
+  // 4) CMD55 + ACMD41 反复直到就绪
+  bool ready = false;
+  for (int i = 0; i < 200; i++) {
+    uint8_t r55 = sdCmd(55, 0, 0x01); sdEndCmd();
+    if (r55 != 0x01 && r55 != 0x00) { LOG.printf("  CMD55 异常 R1=0x%02X\n", r55); break; }
+    uint8_t r41 = sdCmd(41, 0x40000000, 0xFF); sdEndCmd();
+    if (i < 5) LOG.printf("    第%d次: CMD55=0x%02X ACMD41=0x%02X\n", i + 1, r55, r41);
+    if (r41 == 0x00) { ready = true; break; }
+    if (r41 != 0x01) { LOG.printf("  ACMD41 异常 R1=0x%02X\n", r41); break; }
+    delay(10);
+  }
+  LOG.printf("  ACMD41(初始化)    -> %s\n", ready ? "OK 卡片就绪" : "超时/失败");
+
+  // 5) 就绪后再读一次 OCR，拿 CCS 位判断卡类型
+  if (ready) {
+    uint8_t rr = sdCmd(58, 0, 0xFF);
+    uint8_t c0 = sdXfer(0xFF), c1 = sdXfer(0xFF), c2 = sdXfer(0xFF), c3 = sdXfer(0xFF);
+    sdEndCmd();
+    LOG.printf("  CMD58 (卡类型)    -> R1=0x%02X  OCR=%02X%02X%02X%02X  %s\n",
+               rr, c0, c1, c2, c3, (c0 & 0x40) ? "CCS=1 SDHC/SDXC" : "CCS=0 SDSC");
+    LOG.println("  结论：SPI 链路通、卡片能通信 —— 挂载失败是【文件系统格式】问题：");
+    LOG.println("    -> 把卡插回电脑，格式化成 FAT32（exFAT/NTFS ESP32 不认）");
+    LOG.println("    -> 卡 >32GB 时 Windows 可能只给 exFAT，要用分区工具强制 FAT32");
+  } else {
+    LOG.println("  结论：CMD0/CMD8/CMD58 都正常，唯独 ACMD41 过不去 ——");
+    LOG.println("    这是【供电掉压】的典型症状：ACMD41 阶段卡片内部初始化会拉高峰值电流。");
+    LOG.println("    按可能性排序：");
+    LOG.println("    1. 供电：SD 模块的 VCC 单独供电（5V 走稳压器），别从板子 3.3V 取电；");
+    LOG.println("       或在模块 VCC-GND 两端并一个 100uF 电解电容，尽量靠近卡片。");
+    LOG.println("    2. 线材：杜邦线太长/太细，VCC 和 GND 换粗短线，尽量短。");
+    LOG.println("    3. 卡：换一张卡试（部分杂牌卡初始化电流特别大）。");
+    LOG.println("    4. 卡本身：拿到电脑上重新格式化成 FAT32 再插。");
+  }
+  digitalWrite(SD_CS, HIGH);
+}
 
 // 挂载 SD 卡。失败时逐个频率重试，并打印卡片信息。
 // 有些模块/卡对频率敏感（走线长、模块带稳压器降压），4MHz 不行 1MHz 行。
@@ -1516,6 +1616,7 @@ void printSerialHelp() {
   LOG.println("  list = 查看名单（含编号）");
   LOG.println("  t    = 状态页：屏幕+串口看各模块运行状况（没有指示灯就看这个）");
   LOG.println("  ls   = 列出 SD 卡根目录的文件");
+  LOG.println("  sdtest = SD 低层探测：判断是接线问题还是格式问题");
   LOG.println("  probe    = 读卡器自检：连续扫 10 秒，打印每张卡的 UID 和卡内编号");
   LOG.println("  sim=<姓名>   模拟刷某人的卡");
   LOG.println("  sim=<UID>    模拟刷指定 UID");
@@ -1589,6 +1690,10 @@ void handleSerialSetup() {
       handled = true;
       if (!sdReady) LOG.println("ls: SD 卡没挂上");
       else listSdFiles("---- SD 卡根目录 ----");
+    }
+    if (strcmp(line, "sdtest") == 0) {
+      handled = true;
+      sdLowLevelProbe();
     }
     if (strncmp(line, "name=", 5) == 0) {
       handled = true;
@@ -1777,6 +1882,9 @@ void handleCommand(String cmd) {
   else if (c == 'l' || c == 'L') {
     if (!sdReady) { LOG.println("ls: SD 卡没挂上"); }
     else listSdFiles("---- SD 卡根目录 ----");
+  }
+  else if (cmd.startsWith("sdtest")) {
+    sdLowLevelProbe();
   }
   else if (c == 't' || c == 'T') {
     if (statusViewActive) {
